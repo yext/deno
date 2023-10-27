@@ -1,8 +1,11 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 
+use super::analysis::CodeActionData;
 use super::code_lens;
 use super::config;
+use super::documents::file_like_to_file_specifier;
 use super::documents::AssetOrDocument;
+use super::documents::DocumentsFilter;
 use super::language_server;
 use super::language_server::StateSnapshot;
 use super::performance::Performance;
@@ -13,21 +16,29 @@ use super::refactor::EXTRACT_INTERFACE;
 use super::refactor::EXTRACT_TYPE;
 use super::semantic_tokens;
 use super::semantic_tokens::SemanticTokensBuilder;
-use super::text;
 use super::text::LineIndex;
+use super::urls::LspClientUrl;
 use super::urls::LspUrlMap;
 use super::urls::INVALID_SPECIFIER;
 
-use crate::config_file::TsConfig;
-use crate::fs_util::specifier_to_file_path;
+use crate::args::FmtOptionsConfig;
+use crate::args::TsConfig;
+use crate::cache::HttpCache;
+use crate::lsp::cache::CacheMetadata;
+use crate::lsp::documents::Documents;
+use crate::lsp::logging::lsp_warn;
 use crate::tsc;
 use crate::tsc::ResolveArgs;
+use crate::util::path::relative_specifier;
+use crate::util::path::specifier_to_file_path;
 
+use dashmap::DashMap;
+use deno_ast::MediaType;
 use deno_core::anyhow::anyhow;
 use deno_core::error::custom_error;
 use deno_core::error::AnyError;
 use deno_core::located_script_name;
-use deno_core::op;
+use deno_core::op2;
 use deno_core::parking_lot::Mutex;
 use deno_core::resolve_url;
 use deno_core::serde::de;
@@ -36,22 +47,22 @@ use deno_core::serde::Serialize;
 use deno_core::serde_json;
 use deno_core::serde_json::json;
 use deno_core::serde_json::Value;
-use deno_core::url::Url;
-use deno_core::Extension;
 use deno_core::JsRuntime;
 use deno_core::ModuleSpecifier;
 use deno_core::OpState;
 use deno_core::RuntimeOptions;
 use deno_runtime::tokio_util::create_basic_runtime;
+use lazy_regex::lazy_regex;
 use log::error;
-use log::warn;
 use once_cell::sync::Lazy;
 use regex::Captures;
 use regex::Regex;
-use std::borrow::Cow;
+use serde_repr::Deserialize_repr;
+use serde_repr::Serialize_repr;
 use std::cmp;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -65,43 +76,150 @@ use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types as lsp;
 
 static BRACKET_ACCESSOR_RE: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r#"^\[['"](.+)[\['"]\]$"#).unwrap());
-static CAPTION_RE: Lazy<Regex> = Lazy::new(|| {
-  Regex::new(r"<caption>(.*?)</caption>\s*\r?\n((?:\s|\S)*)").unwrap()
-});
-static CODEBLOCK_RE: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"^\s*[~`]{3}").unwrap());
-static EMAIL_MATCH_RE: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"(.+)\s<([-.\w]+@[-.\w]+)>").unwrap());
-static HTTP_RE: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r#"(?i)^https?:"#).unwrap());
-static JSDOC_LINKS_RE: Lazy<Regex> = Lazy::new(|| {
-  Regex::new(r"(?i)\{@(link|linkplain|linkcode) (https?://[^ |}]+?)(?:[| ]([^{}\n]+?))?\}").unwrap()
-});
-static PART_KIND_MODIFIER_RE: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r",|\s+").unwrap());
-static PART_RE: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"^(\S+)\s*-?\s*").unwrap());
-static SCOPE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"scope_(\d)").unwrap());
+  lazy_regex!(r#"^\[['"](.+)[\['"]\]$"#);
+static CAPTION_RE: Lazy<Regex> =
+  lazy_regex!(r"<caption>(.*?)</caption>\s*\r?\n((?:\s|\S)*)");
+static CODEBLOCK_RE: Lazy<Regex> = lazy_regex!(r"^\s*[~`]{3}");
+static EMAIL_MATCH_RE: Lazy<Regex> = lazy_regex!(r"(.+)\s<([-.\w]+@[-.\w]+)>");
+static HTTP_RE: Lazy<Regex> = lazy_regex!(r#"(?i)^https?:"#);
+static JSDOC_LINKS_RE: Lazy<Regex> = lazy_regex!(
+  r"(?i)\{@(link|linkplain|linkcode) (https?://[^ |}]+?)(?:[| ]([^{}\n]+?))?\}"
+);
+static PART_KIND_MODIFIER_RE: Lazy<Regex> = lazy_regex!(r",|\s+");
+static PART_RE: Lazy<Regex> = lazy_regex!(r"^(\S+)\s*-?\s*");
+static SCOPE_RE: Lazy<Regex> = lazy_regex!(r"scope_(\d)");
 
 const FILE_EXTENSION_KIND_MODIFIERS: &[&str] =
   &[".d.ts", ".ts", ".tsx", ".js", ".jsx", ".json"];
 
 type Request = (
-  RequestMethod,
+  TscRequest,
   Arc<StateSnapshot>,
   oneshot::Sender<Result<Value, AnyError>>,
   CancellationToken,
 );
 
+#[derive(Debug, Clone, Copy, Serialize_repr)]
+#[repr(u8)]
+pub enum IndentStyle {
+  #[allow(dead_code)]
+  None = 0,
+  Block = 1,
+  #[allow(dead_code)]
+  Smart = 2,
+}
+
+/// Relevant subset of https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6658.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormatCodeSettings {
+  base_indent_size: Option<u8>,
+  indent_size: Option<u8>,
+  tab_size: Option<u8>,
+  new_line_character: Option<String>,
+  convert_tabs_to_spaces: Option<bool>,
+  indent_style: Option<IndentStyle>,
+  trim_trailing_whitespace: Option<bool>,
+  insert_space_after_comma_delimiter: Option<bool>,
+  insert_space_after_semicolon_in_for_statements: Option<bool>,
+  insert_space_before_and_after_binary_operators: Option<bool>,
+  insert_space_after_constructor: Option<bool>,
+  insert_space_after_keywords_in_control_flow_statements: Option<bool>,
+  insert_space_after_function_keyword_for_anonymous_functions: Option<bool>,
+  insert_space_after_opening_and_before_closing_nonempty_parenthesis:
+    Option<bool>,
+  insert_space_after_opening_and_before_closing_nonempty_brackets: Option<bool>,
+  insert_space_after_opening_and_before_closing_nonempty_braces: Option<bool>,
+  insert_space_after_opening_and_before_closing_template_string_braces:
+    Option<bool>,
+  insert_space_after_opening_and_before_closing_jsx_expression_braces:
+    Option<bool>,
+  insert_space_after_type_assertion: Option<bool>,
+  insert_space_before_function_parenthesis: Option<bool>,
+  place_open_brace_on_new_line_for_functions: Option<bool>,
+  place_open_brace_on_new_line_for_control_blocks: Option<bool>,
+  insert_space_before_type_annotation: Option<bool>,
+  indent_multi_line_object_literal_beginning_on_blank_line: Option<bool>,
+  semicolons: Option<SemicolonPreference>,
+  indent_switch_case: Option<bool>,
+}
+
+impl From<&FmtOptionsConfig> for FormatCodeSettings {
+  fn from(config: &FmtOptionsConfig) -> Self {
+    FormatCodeSettings {
+      base_indent_size: Some(0),
+      indent_size: Some(config.indent_width.unwrap_or(2)),
+      tab_size: Some(config.indent_width.unwrap_or(2)),
+      new_line_character: Some("\n".to_string()),
+      convert_tabs_to_spaces: Some(!config.use_tabs.unwrap_or(false)),
+      indent_style: Some(IndentStyle::Block),
+      trim_trailing_whitespace: Some(false),
+      insert_space_after_comma_delimiter: Some(true),
+      insert_space_after_semicolon_in_for_statements: Some(true),
+      insert_space_before_and_after_binary_operators: Some(true),
+      insert_space_after_constructor: Some(false),
+      insert_space_after_keywords_in_control_flow_statements: Some(true),
+      insert_space_after_function_keyword_for_anonymous_functions: Some(true),
+      insert_space_after_opening_and_before_closing_nonempty_parenthesis: Some(
+        false,
+      ),
+      insert_space_after_opening_and_before_closing_nonempty_brackets: Some(
+        false,
+      ),
+      insert_space_after_opening_and_before_closing_nonempty_braces: Some(true),
+      insert_space_after_opening_and_before_closing_template_string_braces:
+        Some(false),
+      insert_space_after_opening_and_before_closing_jsx_expression_braces: Some(
+        false,
+      ),
+      insert_space_after_type_assertion: Some(false),
+      insert_space_before_function_parenthesis: Some(false),
+      place_open_brace_on_new_line_for_functions: Some(false),
+      place_open_brace_on_new_line_for_control_blocks: Some(false),
+      insert_space_before_type_annotation: Some(false),
+      indent_multi_line_object_literal_beginning_on_blank_line: Some(false),
+      semicolons: match config.semi_colons {
+        Some(false) => Some(SemicolonPreference::Remove),
+        _ => Some(SemicolonPreference::Insert),
+      },
+      indent_switch_case: Some(true),
+    }
+  }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SemicolonPreference {
+  Insert,
+  Remove,
+}
+
+fn normalize_diagnostic(
+  diagnostic: &mut crate::tsc::Diagnostic,
+  specifier_map: &TscSpecifierMap,
+) -> Result<(), AnyError> {
+  if let Some(file_name) = &mut diagnostic.file_name {
+    *file_name = specifier_map.normalize(&file_name)?.to_string();
+  }
+  for ri in diagnostic.related_information.iter_mut().flatten() {
+    normalize_diagnostic(ri, specifier_map)?;
+  }
+  Ok(())
+}
+
 #[derive(Clone, Debug)]
-pub struct TsServer(mpsc::UnboundedSender<Request>);
+pub struct TsServer {
+  sender: mpsc::UnboundedSender<Request>,
+  specifier_map: Arc<TscSpecifierMap>,
+}
 
 impl TsServer {
-  pub fn new(performance: Arc<Performance>) -> Self {
+  pub fn new(performance: Arc<Performance>, cache: Arc<dyn HttpCache>) -> Self {
+    let specifier_map = Arc::new(TscSpecifierMap::new());
+    let specifier_map_ = specifier_map.clone();
     let (tx, mut rx) = mpsc::unbounded_channel::<Request>();
     let _join_handle = thread::spawn(move || {
-      let mut ts_runtime = js_runtime(performance);
+      let mut ts_runtime = js_runtime(performance, cache, specifier_map_);
 
       let runtime = create_basic_runtime();
       runtime.block_on(async {
@@ -109,25 +227,722 @@ impl TsServer {
         while let Some((req, state_snapshot, tx, token)) = rx.recv().await {
           if !started {
             // TODO(@kitsonk) need to reflect the debug state of the lsp here
-            start(&mut ts_runtime, false, &state_snapshot)
-              .expect("could not start tsc");
+            start(&mut ts_runtime, false).unwrap();
             started = true;
           }
           let value = request(&mut ts_runtime, state_snapshot, req, token);
           if tx.send(value).is_err() {
-            warn!("Unable to send result to client.");
+            lsp_warn!("Unable to send result to client.");
           }
         }
       })
     });
 
-    Self(tx)
+    Self {
+      sender: tx,
+      specifier_map,
+    }
   }
 
-  pub async fn request<R>(
+  pub async fn get_diagnostics(
     &self,
     snapshot: Arc<StateSnapshot>,
-    req: RequestMethod,
+    specifiers: Vec<ModuleSpecifier>,
+    token: CancellationToken,
+  ) -> Result<HashMap<String, Vec<crate::tsc::Diagnostic>>, AnyError> {
+    let req = TscRequest {
+      method: "$getDiagnostics",
+      args: json!([specifiers
+        .into_iter()
+        .map(|s| self.specifier_map.denormalize(&s))
+        .collect::<Vec<String>>(),]),
+    };
+    let diagnostics_map_ = self.request_with_cancellation::<HashMap<String, Vec<crate::tsc::Diagnostic>>>(snapshot, req, token).await?;
+    let mut diagnostics_map = HashMap::new();
+    for (mut specifier, mut diagnostics) in diagnostics_map_ {
+      specifier = self.specifier_map.normalize(&specifier)?.to_string();
+      for diagnostic in &mut diagnostics {
+        normalize_diagnostic(diagnostic, &self.specifier_map)?;
+      }
+      diagnostics_map.insert(specifier, diagnostics);
+    }
+    Ok(diagnostics_map)
+  }
+
+  pub async fn find_references(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    position: u32,
+  ) -> Result<Option<Vec<ReferencedSymbol>>, LspError> {
+    let req = TscRequest {
+      method: "findReferences",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6230
+      args: json!([self.specifier_map.denormalize(&specifier), position]),
+    };
+    self
+      .request::<Option<Vec<ReferencedSymbol>>>(snapshot, req)
+      .await
+      .and_then(|mut symbols| {
+        for symbol in symbols.iter_mut().flatten() {
+          symbol.normalize(&self.specifier_map)?;
+        }
+        Ok(symbols)
+      })
+      .map_err(|err| {
+        log::error!("Unable to get references from TypeScript: {}", err);
+        LspError::internal_error()
+      })
+  }
+
+  pub async fn get_navigation_tree(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+  ) -> Result<NavigationTree, AnyError> {
+    let req = TscRequest {
+      method: "getNavigationTree",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6235
+      args: json!([self.specifier_map.denormalize(&specifier)]),
+    };
+    self.request(snapshot, req).await
+  }
+
+  pub async fn configure(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    tsconfig: TsConfig,
+  ) -> Result<bool, AnyError> {
+    let req = TscRequest {
+      method: "$configure",
+      args: json!([tsconfig]),
+    };
+    self.request(snapshot, req).await
+  }
+
+  pub async fn get_supported_code_fixes(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+  ) -> Result<Vec<String>, LspError> {
+    let req = TscRequest {
+      method: "$getSupportedCodeFixes",
+      args: json!([]),
+    };
+    self.request(snapshot, req).await.map_err(|err| {
+      log::error!("Unable to get fixable diagnostics: {}", err);
+      LspError::internal_error()
+    })
+  }
+
+  pub async fn get_quick_info(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    position: u32,
+  ) -> Result<Option<QuickInfo>, LspError> {
+    let req = TscRequest {
+      method: "getQuickInfoAtPosition",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6214
+      args: json!([self.specifier_map.denormalize(&specifier), position]),
+    };
+    self.request(snapshot, req).await.map_err(|err| {
+      log::error!("Unable to get quick info: {}", err);
+      LspError::internal_error()
+    })
+  }
+
+  pub async fn get_code_fixes(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    range: Range<u32>,
+    codes: Vec<String>,
+    format_code_settings: FormatCodeSettings,
+    preferences: UserPreferences,
+  ) -> Vec<CodeFixAction> {
+    let req = TscRequest {
+      method: "getCodeFixesAtPosition",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6257
+      args: json!([
+        self.specifier_map.denormalize(&specifier),
+        range.start,
+        range.end,
+        codes,
+        format_code_settings,
+        preferences,
+      ]),
+    };
+    let result = self
+      .request::<Vec<CodeFixAction>>(snapshot, req)
+      .await
+      .and_then(|mut actions| {
+        for action in &mut actions {
+          action.normalize(&self.specifier_map)?;
+        }
+        Ok(actions)
+      });
+    match result {
+      Ok(items) => items,
+      Err(err) => {
+        // sometimes tsc reports errors when retrieving code actions
+        // because they don't reflect the current state of the document
+        // so we will log them to the output, but we won't send an error
+        // message back to the client.
+        log::error!("Error getting actions from TypeScript: {}", err);
+        Vec::new()
+      }
+    }
+  }
+
+  pub async fn get_applicable_refactors(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    range: Range<u32>,
+    preferences: Option<UserPreferences>,
+    only: String,
+  ) -> Result<Vec<ApplicableRefactorInfo>, LspError> {
+    let req = TscRequest {
+      method: "getApplicableRefactors",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6274
+      args: json!([
+        self.specifier_map.denormalize(&specifier),
+        { "pos": range.start, "end": range.end },
+        preferences.unwrap_or_default(),
+        json!(null),
+        only,
+      ]),
+    };
+    self.request(snapshot, req).await.map_err(|err| {
+      log::error!("Failed to request to tsserver {}", err);
+      LspError::invalid_request()
+    })
+  }
+
+  pub async fn get_combined_code_fix(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    code_action_data: &CodeActionData,
+    format_code_settings: FormatCodeSettings,
+    preferences: UserPreferences,
+  ) -> Result<CombinedCodeActions, LspError> {
+    let req = TscRequest {
+      method: "getCombinedCodeFix",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6258
+      args: json!([
+        {
+          "type": "file",
+          "fileName": self.specifier_map.denormalize(&code_action_data.specifier),
+        },
+        &code_action_data.fix_id,
+        format_code_settings,
+        preferences,
+      ]),
+    };
+    self
+      .request::<CombinedCodeActions>(snapshot, req)
+      .await
+      .and_then(|mut actions| {
+        actions.normalize(&self.specifier_map)?;
+        Ok(actions)
+      })
+      .map_err(|err| {
+        log::error!("Unable to get combined fix from TypeScript: {}", err);
+        LspError::internal_error()
+      })
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  pub async fn get_edits_for_refactor(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    format_code_settings: FormatCodeSettings,
+    range: Range<u32>,
+    refactor_name: String,
+    action_name: String,
+    preferences: Option<UserPreferences>,
+  ) -> Result<RefactorEditInfo, LspError> {
+    let req = TscRequest {
+      method: "getEditsForRefactor",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6275
+      args: json!([
+        self.specifier_map.denormalize(&specifier),
+        format_code_settings,
+        { "pos": range.start, "end": range.end },
+        refactor_name,
+        action_name,
+        preferences,
+      ]),
+    };
+    self
+      .request::<RefactorEditInfo>(snapshot, req)
+      .await
+      .and_then(|mut info| {
+        info.normalize(&self.specifier_map)?;
+        Ok(info)
+      })
+      .map_err(|err| {
+        log::error!("Failed to request to tsserver {}", err);
+        LspError::invalid_request()
+      })
+  }
+
+  pub async fn get_edits_for_file_rename(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    old_specifier: ModuleSpecifier,
+    new_specifier: ModuleSpecifier,
+    format_code_settings: FormatCodeSettings,
+    user_preferences: UserPreferences,
+  ) -> Result<Vec<FileTextChanges>, LspError> {
+    let req = TscRequest {
+      method: "getEditsForFileRename",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6281
+      args: json!([
+        self.specifier_map.denormalize(&old_specifier),
+        self.specifier_map.denormalize(&new_specifier),
+        format_code_settings,
+        user_preferences,
+      ]),
+    };
+    self
+      .request::<Vec<FileTextChanges>>(snapshot, req)
+      .await
+      .and_then(|mut changes| {
+        for changes in &mut changes {
+          changes.normalize(&self.specifier_map)?;
+        }
+        Ok(changes)
+      })
+      .map_err(|err| {
+        log::error!("Failed to request to tsserver {}", err);
+        LspError::invalid_request()
+      })
+  }
+
+  pub async fn get_document_highlights(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    position: u32,
+    files_to_search: Vec<ModuleSpecifier>,
+  ) -> Result<Option<Vec<DocumentHighlights>>, LspError> {
+    let req = TscRequest {
+      method: "getDocumentHighlights",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6231
+      args: json!([
+        self.specifier_map.denormalize(&specifier),
+        position,
+        files_to_search
+          .into_iter()
+          .map(|s| self.specifier_map.denormalize(&s))
+          .collect::<Vec<_>>(),
+      ]),
+    };
+    self.request(snapshot, req).await.map_err(|err| {
+      log::error!("Unable to get document highlights from TypeScript: {}", err);
+      LspError::internal_error()
+    })
+  }
+
+  pub async fn get_definition(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    position: u32,
+  ) -> Result<Option<DefinitionInfoAndBoundSpan>, LspError> {
+    let req = TscRequest {
+      method: "getDefinitionAndBoundSpan",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6226
+      args: json!([self.specifier_map.denormalize(&specifier), position]),
+    };
+    self
+      .request::<Option<DefinitionInfoAndBoundSpan>>(snapshot, req)
+      .await
+      .and_then(|mut info| {
+        if let Some(info) = &mut info {
+          info.normalize(&self.specifier_map)?;
+        }
+        Ok(info)
+      })
+      .map_err(|err| {
+        log::error!("Unable to get definition from TypeScript: {}", err);
+        LspError::internal_error()
+      })
+  }
+
+  pub async fn get_type_definition(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    position: u32,
+  ) -> Result<Option<Vec<DefinitionInfo>>, LspError> {
+    let req = TscRequest {
+      method: "getTypeDefinitionAtPosition",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6227
+      args: json!([self.specifier_map.denormalize(&specifier), position]),
+    };
+    self
+      .request::<Option<Vec<DefinitionInfo>>>(snapshot, req)
+      .await
+      .and_then(|mut infos| {
+        for info in infos.iter_mut().flatten() {
+          info.normalize(&self.specifier_map)?;
+        }
+        Ok(infos)
+      })
+      .map_err(|err| {
+        log::error!("Unable to get type definition from TypeScript: {}", err);
+        LspError::internal_error()
+      })
+  }
+
+  pub async fn get_completions(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    position: u32,
+    options: GetCompletionsAtPositionOptions,
+    format_code_settings: FormatCodeSettings,
+  ) -> Option<CompletionInfo> {
+    let req = TscRequest {
+      method: "getCompletionsAtPosition",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6193
+      args: json!([
+        self.specifier_map.denormalize(&specifier),
+        position,
+        options,
+        format_code_settings,
+      ]),
+    };
+    match self.request(snapshot, req).await {
+      Ok(maybe_info) => maybe_info,
+      Err(err) => {
+        log::error!("Unable to get completion info from TypeScript: {:#}", err);
+        None
+      }
+    }
+  }
+
+  pub async fn get_completion_details(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    args: GetCompletionDetailsArgs,
+  ) -> Result<Option<CompletionEntryDetails>, AnyError> {
+    let req = TscRequest {
+      method: "getCompletionEntryDetails",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6205
+      args: json!([
+        self.specifier_map.denormalize(&args.specifier),
+        args.position,
+        args.name,
+        args.format_code_settings.unwrap_or_default(),
+        args.source,
+        args.preferences,
+        args.data,
+      ]),
+    };
+    self
+      .request::<Option<CompletionEntryDetails>>(snapshot, req)
+      .await
+      .and_then(|mut details| {
+        if let Some(details) = &mut details {
+          details.normalize(&self.specifier_map)?;
+        }
+        Ok(details)
+      })
+  }
+
+  pub async fn get_implementations(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    position: u32,
+  ) -> Result<Option<Vec<ImplementationLocation>>, LspError> {
+    let req = TscRequest {
+      method: "getImplementationAtPosition",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6228
+      args: json!([self.specifier_map.denormalize(&specifier), position]),
+    };
+    self
+      .request::<Option<Vec<ImplementationLocation>>>(snapshot, req)
+      .await
+      .and_then(|mut locations| {
+        for location in locations.iter_mut().flatten() {
+          location.normalize(&self.specifier_map)?;
+        }
+        Ok(locations)
+      })
+      .map_err(|err| {
+        log::error!("Failed to request to tsserver {}", err);
+        LspError::invalid_request()
+      })
+  }
+
+  pub async fn get_outlining_spans(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+  ) -> Result<Vec<OutliningSpan>, LspError> {
+    let req = TscRequest {
+      method: "getOutliningSpans",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6240
+      args: json!([self.specifier_map.denormalize(&specifier)]),
+    };
+    self.request(snapshot, req).await.map_err(|err| {
+      log::error!("Failed to request to tsserver {}", err);
+      LspError::invalid_request()
+    })
+  }
+
+  pub async fn provide_call_hierarchy_incoming_calls(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    position: u32,
+  ) -> Result<Vec<CallHierarchyIncomingCall>, LspError> {
+    let req = TscRequest {
+      method: "provideCallHierarchyIncomingCalls",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6237
+      args: json!([self.specifier_map.denormalize(&specifier), position]),
+    };
+    self
+      .request::<Vec<CallHierarchyIncomingCall>>(snapshot, req)
+      .await
+      .and_then(|mut calls| {
+        for call in &mut calls {
+          call.normalize(&self.specifier_map)?;
+        }
+        Ok(calls)
+      })
+      .map_err(|err| {
+        log::error!("Failed to request to tsserver {}", err);
+        LspError::invalid_request()
+      })
+  }
+
+  pub async fn provide_call_hierarchy_outgoing_calls(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    position: u32,
+  ) -> Result<Vec<CallHierarchyOutgoingCall>, LspError> {
+    let req = TscRequest {
+      method: "provideCallHierarchyOutgoingCalls",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6238
+      args: json!([self.specifier_map.denormalize(&specifier), position]),
+    };
+    self
+      .request::<Vec<CallHierarchyOutgoingCall>>(snapshot, req)
+      .await
+      .and_then(|mut calls| {
+        for call in &mut calls {
+          call.normalize(&self.specifier_map)?;
+        }
+        Ok(calls)
+      })
+      .map_err(|err| {
+        log::error!("Failed to request to tsserver {}", err);
+        LspError::invalid_request()
+      })
+  }
+
+  pub async fn prepare_call_hierarchy(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    position: u32,
+  ) -> Result<Option<OneOrMany<CallHierarchyItem>>, LspError> {
+    let req = TscRequest {
+      method: "prepareCallHierarchy",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6236
+      args: json!([self.specifier_map.denormalize(&specifier), position]),
+    };
+    self
+      .request::<Option<OneOrMany<CallHierarchyItem>>>(snapshot, req)
+      .await
+      .and_then(|mut items| {
+        match &mut items {
+          Some(OneOrMany::One(item)) => {
+            item.normalize(&self.specifier_map)?;
+          }
+          Some(OneOrMany::Many(items)) => {
+            for item in items {
+              item.normalize(&self.specifier_map)?;
+            }
+          }
+          None => {}
+        }
+        Ok(items)
+      })
+      .map_err(|err| {
+        log::error!("Failed to request to tsserver {}", err);
+        LspError::invalid_request()
+      })
+  }
+
+  pub async fn find_rename_locations(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    position: u32,
+  ) -> Result<Option<Vec<RenameLocation>>, LspError> {
+    let req = TscRequest {
+      method: "findRenameLocations",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6221
+      args: json!([
+        self.specifier_map.denormalize(&specifier),
+        position,
+        false,
+        false,
+        false,
+      ]),
+    };
+    self
+      .request::<Option<Vec<RenameLocation>>>(snapshot, req)
+      .await
+      .and_then(|mut locations| {
+        for location in locations.iter_mut().flatten() {
+          location.normalize(&self.specifier_map)?;
+        }
+        Ok(locations)
+      })
+      .map_err(|err| {
+        log::error!("Failed to request to tsserver {}", err);
+        LspError::invalid_request()
+      })
+  }
+
+  pub async fn get_smart_selection_range(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    position: u32,
+  ) -> Result<SelectionRange, LspError> {
+    let req = TscRequest {
+      method: "getSmartSelectionRange",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6224
+      args: json!([self.specifier_map.denormalize(&specifier), position]),
+    };
+    self.request(snapshot, req).await.map_err(|err| {
+      log::error!("Failed to request to tsserver {}", err);
+      LspError::invalid_request()
+    })
+  }
+
+  pub async fn get_encoded_semantic_classifications(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    range: Range<u32>,
+  ) -> Result<Classifications, LspError> {
+    let req = TscRequest {
+      method: "getEncodedSemanticClassifications",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6183
+      args: json!([
+        self.specifier_map.denormalize(&specifier),
+        TextSpan {
+          start: range.start,
+          length: range.end - range.start,
+        },
+        "2020",
+      ]),
+    };
+    self.request(snapshot, req).await.map_err(|err| {
+      log::error!("Failed to request to tsserver {}", err);
+      LspError::invalid_request()
+    })
+  }
+
+  pub async fn get_signature_help_items(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    position: u32,
+    options: SignatureHelpItemsOptions,
+  ) -> Result<Option<SignatureHelpItems>, LspError> {
+    let req = TscRequest {
+      method: "getSignatureHelpItems",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6217
+      args: json!([
+        self.specifier_map.denormalize(&specifier),
+        position,
+        options,
+      ]),
+    };
+    self.request(snapshot, req).await.map_err(|err| {
+      log::error!("Failed to request to tsserver: {}", err);
+      LspError::invalid_request()
+    })
+  }
+
+  pub async fn get_navigate_to_items(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    args: GetNavigateToItemsArgs,
+  ) -> Result<Vec<NavigateToItem>, LspError> {
+    let req = TscRequest {
+      method: "getNavigateToItems",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6233
+      args: json!([
+        args.search,
+        args.max_result_count,
+        args.file.map(|f| match resolve_url(&f) {
+          Ok(s) => self.specifier_map.denormalize(&s),
+          Err(_) => f,
+        }),
+      ]),
+    };
+    self
+      .request::<Vec<NavigateToItem>>(snapshot, req)
+      .await
+      .and_then(|mut items| {
+        for items in &mut items {
+          items.normalize(&self.specifier_map)?;
+        }
+        Ok(items)
+      })
+      .map_err(|err| {
+        log::error!("Failed request to tsserver: {}", err);
+        LspError::invalid_request()
+      })
+  }
+
+  pub async fn provide_inlay_hints(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    specifier: ModuleSpecifier,
+    text_span: TextSpan,
+    user_preferences: UserPreferences,
+  ) -> Result<Option<Vec<InlayHint>>, LspError> {
+    let req = TscRequest {
+      method: "provideInlayHints",
+      // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6239
+      args: json!([
+        self.specifier_map.denormalize(&specifier),
+        text_span,
+        user_preferences,
+      ]),
+    };
+    self.request(snapshot, req).await.map_err(|err| {
+      log::error!("Unable to get inlay hints: {}", err);
+      LspError::internal_error()
+    })
+  }
+
+  pub async fn restart(&self, snapshot: Arc<StateSnapshot>) {
+    let req = TscRequest {
+      method: "$restart",
+      args: json!([]),
+    };
+    self.request::<bool>(snapshot, req).await.unwrap();
+  }
+
+  async fn request<R>(
+    &self,
+    snapshot: Arc<StateSnapshot>,
+    req: TscRequest,
   ) -> Result<R, AnyError>
   where
     R: de::DeserializeOwned,
@@ -137,28 +952,28 @@ impl TsServer {
       .await
   }
 
-  pub async fn request_with_cancellation<R>(
+  async fn request_with_cancellation<R>(
     &self,
     snapshot: Arc<StateSnapshot>,
-    req: RequestMethod,
+    req: TscRequest,
     token: CancellationToken,
   ) -> Result<R, AnyError>
   where
     R: de::DeserializeOwned,
   {
     let (tx, rx) = oneshot::channel::<Result<Value, AnyError>>();
-    if self.0.send((req, snapshot, tx, token)).is_err() {
+    if self.sender.send((req, snapshot, tx, token)).is_err() {
       return Err(anyhow!("failed to send request to tsc thread"));
     }
-    rx.await?.map(|v| serde_json::from_value::<R>(v).unwrap())
+    let value = rx.await??;
+    Ok(serde_json::from_value::<R>(value)?)
   }
 }
 
 #[derive(Debug, Clone)]
 struct AssetDocumentInner {
   specifier: ModuleSpecifier,
-  text: Arc<String>,
-  length: usize,
+  text: Arc<str>,
   line_index: Arc<LineIndex>,
   maybe_navigation_tree: Option<Arc<NavigationTree>>,
 }
@@ -173,8 +988,7 @@ impl AssetDocument {
     let text = text.as_ref();
     Self(Arc::new(AssetDocumentInner {
       specifier,
-      text: Arc::new(text.to_string()),
-      length: text.encode_utf16().count(),
+      text: text.into(),
       line_index: Arc::new(LineIndex::new(text)),
       maybe_navigation_tree: None,
     }))
@@ -194,16 +1008,8 @@ impl AssetDocument {
     }))
   }
 
-  pub fn text(&self) -> Arc<String> {
+  pub fn text(&self) -> Arc<str> {
     self.0.text.clone()
-  }
-
-  pub fn text_str(&self) -> &str {
-    self.0.text.as_str()
-  }
-
-  pub fn length(&self) -> usize {
-    self.0.length
   }
 
   pub fn line_index(&self) -> Arc<LineIndex> {
@@ -215,18 +1021,18 @@ impl AssetDocument {
   }
 }
 
-type AssetsMap = HashMap<ModuleSpecifier, Option<AssetDocument>>;
+type AssetsMap = HashMap<ModuleSpecifier, AssetDocument>;
 
 fn new_assets_map() -> Arc<Mutex<AssetsMap>> {
-  let assets = tsc::STATIC_ASSETS
+  let assets = tsc::LAZILY_LOADED_STATIC_ASSETS
     .iter()
     .map(|(k, v)| {
-      let url_str = format!("asset:///{}", k);
+      let url_str = format!("asset:///{k}");
       let specifier = resolve_url(&url_str).unwrap();
       let asset = AssetDocument::new(specifier.clone(), v);
-      (specifier, Some(asset))
+      (specifier, asset)
     })
-    .collect();
+    .collect::<AssetsMap>();
   Arc::new(Mutex::new(assets))
 }
 
@@ -245,10 +1051,7 @@ impl AssetsSnapshot {
     self.0.lock().contains_key(k)
   }
 
-  pub fn get_cached(
-    &self,
-    k: &ModuleSpecifier,
-  ) -> Option<Option<AssetDocument>> {
+  pub fn get(&self, k: &ModuleSpecifier) -> Option<AssetDocument> {
     self.0.lock().get(k).cloned()
   }
 }
@@ -269,47 +1072,25 @@ impl Assets {
     }
   }
 
+  /// Initializes with the assets in the isolate.
+  pub async fn initialize(&self, state_snapshot: Arc<StateSnapshot>) {
+    let assets = get_isolate_assets(&self.ts_server, state_snapshot).await;
+    let mut assets_map = self.assets.lock();
+    for asset in assets {
+      if !assets_map.contains_key(asset.specifier()) {
+        assets_map.insert(asset.specifier().clone(), asset);
+      }
+    }
+  }
+
   pub fn snapshot(&self) -> AssetsSnapshot {
     // it's ok to not make a complete copy for snapshotting purposes
     // because assets are static
     AssetsSnapshot(self.assets.clone())
   }
 
-  pub fn get_cached(
-    &self,
-    k: &ModuleSpecifier,
-  ) -> Option<Option<AssetDocument>> {
-    self.assets.lock().get(k).cloned()
-  }
-
-  pub async fn get(
-    &self,
-    specifier: &ModuleSpecifier,
-    // todo(dsherret): this shouldn't be a parameter, but instead retrieved via
-    // a constructor dependency
-    get_snapshot: impl Fn() -> Arc<StateSnapshot>,
-  ) -> LspResult<Option<AssetDocument>> {
-    // Race conditions are ok to happen here since the assets are static
-    if let Some(maybe_asset) = self.get_cached(specifier) {
-      Ok(maybe_asset)
-    } else {
-      let maybe_asset = get_asset(specifier, &self.ts_server, get_snapshot())
-        .await
-        .map_err(|err| {
-          error!("Error getting asset {}: {}", specifier, err);
-          LspError::internal_error()
-        })?;
-      // if another thread has inserted into the cache, return the asset
-      // that already exists in the cache so that we don't store duplicate
-      // assets in memory anywhere
-      let mut assets = self.assets.lock();
-      if let Some(maybe_asset) = assets.get(specifier) {
-        Ok(maybe_asset.clone())
-      } else {
-        assets.insert(specifier.clone(), maybe_asset.clone());
-        Ok(maybe_asset)
-      }
-    }
+  pub fn get(&self, specifier: &ModuleSpecifier) -> Option<AssetDocument> {
+    self.assets.lock().get(specifier).cloned()
   }
 
   pub fn cache_navigation_tree(
@@ -318,38 +1099,45 @@ impl Assets {
     navigation_tree: Arc<NavigationTree>,
   ) -> Result<(), AnyError> {
     let mut assets = self.assets.lock();
-    let maybe_doc = assets
+    let doc = assets
       .get_mut(specifier)
       .ok_or_else(|| anyhow!("Missing asset."))?;
-    let doc = maybe_doc
-      .as_mut()
-      .ok_or_else(|| anyhow!("Cannot get doc mutable"))?;
     *doc = doc.with_navigation_tree(navigation_tree);
     Ok(())
   }
 }
 
-/// Optionally returns an internal asset, first checking for any static assets
-/// in Rust, then checking any previously retrieved static assets from the
-/// isolate, and then finally, the tsc isolate itself.
-async fn get_asset(
-  specifier: &ModuleSpecifier,
+/// Get all the assets stored in the tsc isolate.
+async fn get_isolate_assets(
   ts_server: &TsServer,
   state_snapshot: Arc<StateSnapshot>,
-) -> Result<Option<AssetDocument>, AnyError> {
-  let specifier_str = specifier.to_string().replace("asset:///", "");
-  if let Some(text) = tsc::get_asset(&specifier_str) {
-    let maybe_asset = Some(AssetDocument::new(specifier.clone(), text));
-    Ok(maybe_asset)
-  } else {
-    let res = ts_server
-      .request(state_snapshot, RequestMethod::GetAsset(specifier.clone()))
-      .await?;
-    let maybe_text: Option<String> = serde_json::from_value(res)?;
-    let maybe_asset =
-      maybe_text.map(|text| AssetDocument::new(specifier.clone(), text));
-    Ok(maybe_asset)
+) -> Vec<AssetDocument> {
+  let req = TscRequest {
+    method: "$getAssets",
+    args: json!([]),
+  };
+  let res: Value = ts_server.request(state_snapshot, req).await.unwrap();
+  let response_assets = match res {
+    Value::Array(value) => value,
+    _ => unreachable!(),
+  };
+  let mut assets = Vec::with_capacity(response_assets.len());
+
+  for asset in response_assets {
+    let mut obj = match asset {
+      Value::Object(obj) => obj,
+      _ => unreachable!(),
+    };
+    let specifier_str = obj.get("specifier").unwrap().as_str().unwrap();
+    let specifier = ModuleSpecifier::parse(specifier_str).unwrap();
+    let text = match obj.remove("text").unwrap() {
+      Value::String(text) => text,
+      _ => unreachable!(),
+    };
+    assets.push(AssetDocument::new(specifier, text));
   }
+
+  assets
 }
 
 fn get_tag_body_text(
@@ -413,9 +1201,9 @@ fn get_tag_documentation(
   let maybe_text = get_tag_body_text(tag, language_server);
   if let Some(text) = maybe_text {
     if text.contains('\n') {
-      format!("{}  \n{}", label, text)
+      format!("{label}  \n{text}")
     } else {
-      format!("{} - {}", label, text)
+      format!("{label} - {text}")
     }
   } else {
     label
@@ -426,7 +1214,7 @@ fn make_codeblock(text: &str) -> String {
   if CODEBLOCK_RE.is_match(text) {
     text.to_string()
   } else {
-    format!("```\n{}\n```", text)
+    format!("```\n{text}\n```")
   }
 }
 
@@ -541,7 +1329,7 @@ pub enum ScriptElementKind {
   Link,
   #[serde(rename = "link name")]
   LinkName,
-  #[serde(rename = "link test")]
+  #[serde(rename = "link text")]
   LinkText,
 }
 
@@ -647,6 +1435,15 @@ pub struct TextSpan {
 }
 
 impl TextSpan {
+  pub fn from_range(
+    range: &lsp::Range,
+    line_index: Arc<LineIndex>,
+  ) -> Result<Self, AnyError> {
+    let start = line_index.offset_tsc(range.start)?;
+    let length = line_index.offset_tsc(range.end)? - start;
+    Ok(Self { start, length })
+  }
+
   pub fn to_range(&self, line_index: Arc<LineIndex>) -> lsp::Range {
     lsp::Range {
       start: line_index.position_tsc(self.start.into()),
@@ -655,7 +1452,7 @@ impl TextSpan {
   }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SymbolDisplayPart {
   text: String,
@@ -663,10 +1460,11 @@ pub struct SymbolDisplayPart {
   // This is only on `JSDocLinkDisplayPart` which extends `SymbolDisplayPart`
   // but is only used as an upcast of a `SymbolDisplayPart` and not explicitly
   // returned by any API, so it is safe to add it as an optional value.
+  #[serde(skip_serializing_if = "Option::is_none")]
   target: Option<DocumentSpan>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JsDocTagInfo {
   name: String,
@@ -720,9 +1518,9 @@ fn display_parts_to_string(
                   .unwrap_or_else(|| "".to_string())
               });
               let link_str = if link.linkcode {
-                format!("[`{}`]({})", link_text, specifier)
+                format!("[`{link_text}`]({specifier})")
               } else {
-                format!("[{}]({})", link_text, specifier)
+                format!("[{link_text}]({specifier})")
               };
               out.push(link_str);
             }
@@ -805,8 +1603,7 @@ impl QuickInfo {
         .join("  \n\n");
       if !tags_preview.is_empty() {
         parts.push(lsp::MarkedString::from_markdown(format!(
-          "\n\n{}",
-          tags_preview
+          "\n\n{tags_preview}"
         )));
       }
     }
@@ -817,7 +1614,7 @@ impl QuickInfo {
   }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentSpan {
   text_span: TextSpan,
@@ -829,16 +1626,24 @@ pub struct DocumentSpan {
 }
 
 impl DocumentSpan {
-  pub async fn to_link(
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    self.file_name = specifier_map.normalize(&self.file_name)?.to_string();
+    Ok(())
+  }
+}
+
+impl DocumentSpan {
+  pub fn to_link(
     &self,
     line_index: Arc<LineIndex>,
     language_server: &language_server::Inner,
   ) -> Option<lsp::LocationLink> {
-    let target_specifier = normalize_specifier(&self.file_name).ok()?;
-    let target_asset_or_doc = language_server
-      .get_asset_or_document(&target_specifier)
-      .await
-      .ok()?;
+    let target_specifier = resolve_url(&self.file_name).ok()?;
+    let target_asset_or_doc =
+      language_server.get_maybe_asset_or_document(&target_specifier)?;
     let target_line_index = target_asset_or_doc.line_index();
     let target_uri = language_server
       .url_map
@@ -867,7 +1672,7 @@ impl DocumentSpan {
       };
     let link = lsp::LocationLink {
       origin_selection_range,
-      target_uri,
+      target_uri: target_uri.into_url(),
       target_range,
       target_selection_range,
     };
@@ -881,15 +1686,16 @@ impl DocumentSpan {
     &self,
     language_server: &language_server::Inner,
   ) -> Option<ModuleSpecifier> {
-    let specifier = normalize_specifier(&self.file_name).ok()?;
+    let specifier = resolve_url(&self.file_name).ok()?;
     let asset_or_doc =
-      language_server.get_maybe_cached_asset_or_document(&specifier)?;
+      language_server.get_maybe_asset_or_document(&specifier)?;
     let line_index = asset_or_doc.line_index();
     let range = self.text_span.to_range(line_index);
     let mut target = language_server
       .url_map
       .normalize_specifier(&specifier)
-      .ok()?;
+      .ok()?
+      .into_url();
     target.set_fragment(Some(&format!(
       "L{},{}",
       range.start.line + 1,
@@ -927,22 +1733,33 @@ pub struct NavigateToItem {
 }
 
 impl NavigateToItem {
-  pub async fn to_symbol_information(
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    self.file_name = specifier_map.normalize(&self.file_name)?.to_string();
+    Ok(())
+  }
+}
+
+impl NavigateToItem {
+  pub fn to_symbol_information(
     &self,
-    language_server: &mut language_server::Inner,
+    language_server: &language_server::Inner,
   ) -> Option<lsp::SymbolInformation> {
-    let specifier = normalize_specifier(&self.file_name).ok()?;
-    let asset_or_doc = language_server
-      .get_asset_or_document(&specifier)
-      .await
-      .ok()?;
+    let specifier = resolve_url(&self.file_name).ok()?;
+    let asset_or_doc =
+      language_server.get_asset_or_document(&specifier).ok()?;
     let line_index = asset_or_doc.line_index();
     let uri = language_server
       .url_map
       .normalize_specifier(&specifier)
       .ok()?;
     let range = self.text_span.to_range(line_index);
-    let location = lsp::Location { uri, range };
+    let location = lsp::Location {
+      uri: uri.into_url(),
+      range,
+    };
 
     let mut tags: Option<Vec<lsp::SymbolTag>> = None;
     let kind_modifiers = parse_kind_modifier(&self.kind_modifiers);
@@ -962,6 +1779,48 @@ impl NavigateToItem {
       location,
       container_name: self.container_name.clone(),
     })
+  }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub enum InlayHintKind {
+  Type,
+  Parameter,
+  Enum,
+}
+
+impl InlayHintKind {
+  pub fn to_lsp(&self) -> Option<lsp::InlayHintKind> {
+    match self {
+      Self::Enum => None,
+      Self::Parameter => Some(lsp::InlayHintKind::PARAMETER),
+      Self::Type => Some(lsp::InlayHintKind::TYPE),
+    }
+  }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlayHint {
+  pub text: String,
+  pub position: u32,
+  pub kind: InlayHintKind,
+  pub whitespace_before: Option<bool>,
+  pub whitespace_after: Option<bool>,
+}
+
+impl InlayHint {
+  pub fn to_lsp(&self, line_index: Arc<LineIndex>) -> lsp::InlayHint {
+    lsp::InlayHint {
+      position: line_index.position_tsc(self.position.into()),
+      label: lsp::InlayHintLabel::String(self.text.clone()),
+      kind: self.kind.to_lsp(),
+      padding_left: self.whitespace_before,
+      padding_right: self.whitespace_after,
+      text_edits: None,
+      tooltip: None,
+      data: None,
+    }
   }
 }
 
@@ -1008,15 +1867,19 @@ impl NavigationTree {
   ) -> bool {
     let mut should_include = self.should_include_entry();
     if !should_include
-      && self.child_items.as_ref().map_or(true, |v| v.is_empty())
+      && self
+        .child_items
+        .as_ref()
+        .map(|v| v.is_empty())
+        .unwrap_or(true)
     {
       return false;
     }
 
     let children = self
       .child_items
-      .as_ref()
-      .map_or(&[] as &[NavigationTree], |v| v.as_slice());
+      .as_deref()
+      .unwrap_or(&[] as &[NavigationTree]);
     for span in self.spans.iter() {
       let range = TextRange::at(span.start.into(), span.length.into());
       let mut symbol_children = Vec::<lsp::DocumentSymbol>::new();
@@ -1131,32 +1994,39 @@ pub struct ImplementationLocation {
 }
 
 impl ImplementationLocation {
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    self.document_span.normalize(specifier_map)?;
+    Ok(())
+  }
+
   pub fn to_location(
     &self,
     line_index: Arc<LineIndex>,
     language_server: &language_server::Inner,
   ) -> lsp::Location {
-    let specifier = normalize_specifier(&self.document_span.file_name)
+    let specifier = resolve_url(&self.document_span.file_name)
       .unwrap_or_else(|_| ModuleSpecifier::parse("deno://invalid").unwrap());
     let uri = language_server
       .url_map
       .normalize_specifier(&specifier)
-      .unwrap_or_else(|_| ModuleSpecifier::parse("deno://invalid").unwrap());
+      .unwrap_or_else(|_| {
+        LspClientUrl::new(ModuleSpecifier::parse("deno://invalid").unwrap())
+      });
     lsp::Location {
-      uri,
+      uri: uri.into_url(),
       range: self.document_span.text_span.to_range(line_index),
     }
   }
 
-  pub async fn to_link(
+  pub fn to_link(
     &self,
     line_index: Arc<LineIndex>,
     language_server: &language_server::Inner,
   ) -> Option<lsp::LocationLink> {
-    self
-      .document_span
-      .to_link(line_index, language_server)
-      .await
+    self.document_span.to_link(line_index, language_server)
   }
 }
 
@@ -1170,6 +2040,16 @@ pub struct RenameLocation {
   // suffix_text: Option<String>,
 }
 
+impl RenameLocation {
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    self.document_span.normalize(specifier_map)?;
+    Ok(())
+  }
+}
+
 pub struct RenameLocations {
   pub locations: Vec<RenameLocation>,
 }
@@ -1180,13 +2060,14 @@ impl RenameLocations {
     new_name: &str,
     language_server: &language_server::Inner,
   ) -> Result<lsp::WorkspaceEdit, AnyError> {
-    let mut text_document_edit_map: HashMap<Url, lsp::TextDocumentEdit> =
-      HashMap::new();
+    let mut text_document_edit_map: HashMap<
+      LspClientUrl,
+      lsp::TextDocumentEdit,
+    > = HashMap::new();
     for location in self.locations.iter() {
-      let specifier = normalize_specifier(&location.document_span.file_name)?;
+      let specifier = resolve_url(&location.document_span.file_name)?;
       let uri = language_server.url_map.normalize_specifier(&specifier)?;
-      let asset_or_doc =
-        language_server.get_asset_or_document(&specifier).await?;
+      let asset_or_doc = language_server.get_asset_or_document(&specifier)?;
 
       // ensure TextDocumentEdit for `location.file_name`.
       if text_document_edit_map.get(&uri).is_none() {
@@ -1194,7 +2075,7 @@ impl RenameLocations {
           uri.clone(),
           lsp::TextDocumentEdit {
             text_document: lsp::OptionalVersionedTextDocumentIdentifier {
-              uri: uri.clone(),
+              uri: uri.as_url().clone(),
               version: asset_or_doc.document_lsp_version(),
             },
             edits:
@@ -1246,7 +2127,7 @@ pub struct HighlightSpan {
   kind: HighlightSpanKind,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DefinitionInfo {
   // kind: ScriptElementKind,
@@ -1257,6 +2138,16 @@ pub struct DefinitionInfo {
   pub document_span: DocumentSpan,
 }
 
+impl DefinitionInfo {
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    self.document_span.normalize(specifier_map)?;
+    Ok(())
+  }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DefinitionInfoAndBoundSpan {
@@ -1265,6 +2156,16 @@ pub struct DefinitionInfoAndBoundSpan {
 }
 
 impl DefinitionInfoAndBoundSpan {
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    for definition in self.definitions.iter_mut().flatten() {
+      definition.normalize(specifier_map)?;
+    }
+    Ok(())
+  }
+
   pub async fn to_definition(
     &self,
     line_index: Arc<LineIndex>,
@@ -1276,7 +2177,6 @@ impl DefinitionInfoAndBoundSpan {
         if let Some(link) = di
           .document_span
           .to_link(line_index.clone(), language_server)
-          .await
         {
           location_links.push(link);
         }
@@ -1324,7 +2224,14 @@ pub struct TextChange {
 }
 
 impl TextChange {
-  pub fn as_text_edit(
+  pub fn as_text_edit(&self, line_index: Arc<LineIndex>) -> lsp::TextEdit {
+    lsp::TextEdit {
+      range: self.span.to_range(line_index),
+      new_text: self.new_text.clone(),
+    }
+  }
+
+  pub fn as_text_or_annotated_text_edit(
     &self,
     line_index: Arc<LineIndex>,
   ) -> lsp::OneOf<lsp::TextEdit, lsp::AnnotatedTextEdit> {
@@ -1345,36 +2252,42 @@ pub struct FileTextChanges {
 }
 
 impl FileTextChanges {
-  pub async fn to_text_document_edit(
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    self.file_name = specifier_map.normalize(&self.file_name)?.to_string();
+    Ok(())
+  }
+
+  pub fn to_text_document_edit(
     &self,
     language_server: &language_server::Inner,
   ) -> Result<lsp::TextDocumentEdit, AnyError> {
-    let specifier = normalize_specifier(&self.file_name)?;
-    let asset_or_doc =
-      language_server.get_asset_or_document(&specifier).await?;
+    let specifier = resolve_url(&self.file_name)?;
+    let asset_or_doc = language_server.get_asset_or_document(&specifier)?;
     let edits = self
       .text_changes
       .iter()
-      .map(|tc| tc.as_text_edit(asset_or_doc.line_index()))
+      .map(|tc| tc.as_text_or_annotated_text_edit(asset_or_doc.line_index()))
       .collect();
     Ok(lsp::TextDocumentEdit {
       text_document: lsp::OptionalVersionedTextDocumentIdentifier {
-        uri: specifier.clone(),
+        uri: specifier,
         version: asset_or_doc.document_lsp_version(),
       },
       edits,
     })
   }
 
-  pub async fn to_text_document_change_ops(
+  pub fn to_text_document_change_ops(
     &self,
     language_server: &language_server::Inner,
   ) -> Result<Vec<lsp::DocumentChangeOperation>, AnyError> {
     let mut ops = Vec::<lsp::DocumentChangeOperation>::new();
-    let specifier = normalize_specifier(&self.file_name)?;
+    let specifier = resolve_url(&self.file_name)?;
     let maybe_asset_or_document = if !self.is_new_file.unwrap_or(false) {
-      let asset_or_doc =
-        language_server.get_asset_or_document(&specifier).await?;
+      let asset_or_doc = language_server.get_asset_or_document(&specifier)?;
       Some(asset_or_doc)
     } else {
       None
@@ -1400,11 +2313,11 @@ impl FileTextChanges {
     let edits = self
       .text_changes
       .iter()
-      .map(|tc| tc.as_text_edit(line_index.clone()))
+      .map(|tc| tc.as_text_or_annotated_text_edit(line_index.clone()))
       .collect();
     ops.push(lsp::DocumentChangeOperation::Edit(lsp::TextDocumentEdit {
       text_document: lsp::OptionalVersionedTextDocumentIdentifier {
-        uri: specifier.clone(),
+        uri: specifier,
         version: maybe_asset_or_document.and_then(|d| d.document_lsp_version()),
       },
       edits,
@@ -1498,7 +2411,8 @@ impl RefactorActionInfo {
         .iter()
         .find(|action| action.matches(&self.name));
       maybe_match
-        .map_or(lsp::CodeActionKind::REFACTOR, |action| action.kind.clone())
+        .map(|action| action.kind.clone())
+        .unwrap_or(lsp::CodeActionKind::REFACTOR)
     }
   }
 
@@ -1594,7 +2508,29 @@ impl ApplicableRefactorInfo {
   }
 }
 
-#[derive(Debug, Deserialize)]
+pub fn file_text_changes_to_workspace_edit(
+  changes: &[FileTextChanges],
+  language_server: &language_server::Inner,
+) -> LspResult<Option<lsp::WorkspaceEdit>> {
+  let mut all_ops = Vec::<lsp::DocumentChangeOperation>::new();
+  for change in changes {
+    let ops = match change.to_text_document_change_ops(language_server) {
+      Ok(op) => op,
+      Err(err) => {
+        error!("Unable to convert changes to edits: {}", err);
+        return Err(LspError::internal_error());
+      }
+    };
+    all_ops.extend(ops);
+  }
+
+  Ok(Some(lsp::WorkspaceEdit {
+    document_changes: Some(lsp::DocumentChanges::Operations(all_ops)),
+    ..Default::default()
+  }))
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RefactorEditInfo {
   edits: Vec<FileTextChanges>,
@@ -1603,30 +2539,43 @@ pub struct RefactorEditInfo {
 }
 
 impl RefactorEditInfo {
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    for changes in &mut self.edits {
+      changes.normalize(specifier_map)?;
+    }
+    Ok(())
+  }
+
   pub async fn to_workspace_edit(
     &self,
     language_server: &language_server::Inner,
-  ) -> Result<Option<lsp::WorkspaceEdit>, AnyError> {
-    let mut all_ops = Vec::<lsp::DocumentChangeOperation>::new();
-    for edit in self.edits.iter() {
-      let ops = edit.to_text_document_change_ops(language_server).await?;
-      all_ops.extend(ops);
-    }
-
-    Ok(Some(lsp::WorkspaceEdit {
-      document_changes: Some(lsp::DocumentChanges::Operations(all_ops)),
-      ..Default::default()
-    }))
+  ) -> LspResult<Option<lsp::WorkspaceEdit>> {
+    file_text_changes_to_workspace_edit(&self.edits, language_server)
   }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAction {
-  // description: String,
-// changes: Vec<FileTextChanges>,
-// #[serde(skip_serializing_if = "Option::is_none")]
-// commands: Option<Vec<Value>>,
+  description: String,
+  changes: Vec<FileTextChanges>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  commands: Option<Vec<Value>>,
+}
+
+impl CodeAction {
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    for changes in &mut self.changes {
+      changes.normalize(specifier_map)?;
+    }
+    Ok(())
+  }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1650,6 +2599,18 @@ pub struct CodeFixAction {
   pub fix_all_description: Option<String>,
 }
 
+impl CodeFixAction {
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    for changes in &mut self.changes {
+      changes.normalize(specifier_map)?;
+    }
+    Ok(())
+  }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CombinedCodeActions {
@@ -1657,14 +2618,91 @@ pub struct CombinedCodeActions {
   pub commands: Option<Vec<Value>>,
 }
 
-#[derive(Debug, Deserialize)]
+impl CombinedCodeActions {
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    for changes in &mut self.changes {
+      changes.normalize(specifier_map)?;
+    }
+    Ok(())
+  }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferencedSymbol {
+  pub definition: ReferencedSymbolDefinitionInfo,
+  pub references: Vec<ReferencedSymbolEntry>,
+}
+
+impl ReferencedSymbol {
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    self.definition.normalize(specifier_map)?;
+    for reference in &mut self.references {
+      reference.normalize(specifier_map)?;
+    }
+    Ok(())
+  }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferencedSymbolDefinitionInfo {
+  #[serde(flatten)]
+  pub definition_info: DefinitionInfo,
+}
+
+impl ReferencedSymbolDefinitionInfo {
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    self.definition_info.normalize(specifier_map)?;
+    Ok(())
+  }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferencedSymbolEntry {
+  #[serde(default)]
+  pub is_definition: bool,
+  #[serde(flatten)]
+  pub entry: ReferenceEntry,
+}
+
+impl ReferencedSymbolEntry {
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    self.entry.normalize(specifier_map)?;
+    Ok(())
+  }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReferenceEntry {
   // is_write_access: bool,
-  pub is_definition: bool,
   // is_in_string: Option<bool>,
   #[serde(flatten)]
   pub document_span: DocumentSpan,
+}
+
+impl ReferenceEntry {
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    self.document_span.normalize(specifier_map)?;
+    Ok(())
+  }
 }
 
 impl ReferenceEntry {
@@ -1673,13 +2711,13 @@ impl ReferenceEntry {
     line_index: Arc<LineIndex>,
     url_map: &LspUrlMap,
   ) -> lsp::Location {
-    let specifier = normalize_specifier(&self.document_span.file_name)
+    let specifier = resolve_url(&self.document_span.file_name)
       .unwrap_or_else(|_| INVALID_SPECIFIER.clone());
     let uri = url_map
       .normalize_specifier(&specifier)
-      .unwrap_or_else(|_| INVALID_SPECIFIER.clone());
+      .unwrap_or_else(|_| LspClientUrl::new(INVALID_SPECIFIER.clone()));
     lsp::Location {
-      uri,
+      uri: uri.into_url(),
       range: self.document_span.text_span.to_range(line_index),
     }
   }
@@ -1700,16 +2738,22 @@ pub struct CallHierarchyItem {
 }
 
 impl CallHierarchyItem {
-  pub async fn try_resolve_call_hierarchy_item(
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    self.file = specifier_map.normalize(&self.file)?.to_string();
+    Ok(())
+  }
+
+  pub fn try_resolve_call_hierarchy_item(
     &self,
     language_server: &language_server::Inner,
     maybe_root_path: Option<&Path>,
   ) -> Option<lsp::CallHierarchyItem> {
-    let target_specifier = normalize_specifier(&self.file).ok()?;
-    let target_asset_or_doc = language_server
-      .get_asset_or_document(&target_specifier)
-      .await
-      .ok()?;
+    let target_specifier = resolve_url(&self.file).ok()?;
+    let target_asset_or_doc =
+      language_server.get_maybe_asset_or_document(&target_specifier)?;
 
     Some(self.to_call_hierarchy_item(
       target_asset_or_doc.line_index(),
@@ -1724,16 +2768,16 @@ impl CallHierarchyItem {
     language_server: &language_server::Inner,
     maybe_root_path: Option<&Path>,
   ) -> lsp::CallHierarchyItem {
-    let target_specifier = normalize_specifier(&self.file)
-      .unwrap_or_else(|_| INVALID_SPECIFIER.clone());
+    let target_specifier =
+      resolve_url(&self.file).unwrap_or_else(|_| INVALID_SPECIFIER.clone());
     let uri = language_server
       .url_map
       .normalize_specifier(&target_specifier)
-      .unwrap_or_else(|_| INVALID_SPECIFIER.clone());
+      .unwrap_or_else(|_| LspClientUrl::new(INVALID_SPECIFIER.clone()));
 
     let use_file_name = self.is_source_file_item();
-    let maybe_file_path = if uri.scheme() == "file" {
-      specifier_to_file_path(&uri).ok()
+    let maybe_file_path = if uri.as_url().scheme() == "file" {
+      specifier_to_file_path(uri.as_url()).ok()
     } else {
       None
     };
@@ -1741,7 +2785,7 @@ impl CallHierarchyItem {
       if let Some(file_path) = maybe_file_path.as_ref() {
         file_path.file_name().unwrap().to_string_lossy().to_string()
       } else {
-        uri.to_string()
+        uri.as_str().to_string()
       }
     } else {
       self.name.clone()
@@ -1777,7 +2821,7 @@ impl CallHierarchyItem {
     lsp::CallHierarchyItem {
       name,
       tags,
-      uri,
+      uri: uri.into_url(),
       detail: Some(detail),
       kind: self.kind.clone().into(),
       range: self.span.to_range(line_index.clone()),
@@ -1801,16 +2845,22 @@ pub struct CallHierarchyIncomingCall {
 }
 
 impl CallHierarchyIncomingCall {
-  pub async fn try_resolve_call_hierarchy_incoming_call(
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    self.from.normalize(specifier_map)?;
+    Ok(())
+  }
+
+  pub fn try_resolve_call_hierarchy_incoming_call(
     &self,
     language_server: &language_server::Inner,
     maybe_root_path: Option<&Path>,
   ) -> Option<lsp::CallHierarchyIncomingCall> {
-    let target_specifier = normalize_specifier(&self.from.file).ok()?;
-    let target_asset_or_doc = language_server
-      .get_asset_or_document(&target_specifier)
-      .await
-      .ok()?;
+    let target_specifier = resolve_url(&self.from.file).ok()?;
+    let target_asset_or_doc =
+      language_server.get_maybe_asset_or_document(&target_specifier)?;
 
     Some(lsp::CallHierarchyIncomingCall {
       from: self.from.to_call_hierarchy_item(
@@ -1835,17 +2885,23 @@ pub struct CallHierarchyOutgoingCall {
 }
 
 impl CallHierarchyOutgoingCall {
-  pub async fn try_resolve_call_hierarchy_outgoing_call(
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    self.to.normalize(specifier_map)?;
+    Ok(())
+  }
+
+  pub fn try_resolve_call_hierarchy_outgoing_call(
     &self,
     line_index: Arc<LineIndex>,
     language_server: &language_server::Inner,
     maybe_root_path: Option<&Path>,
   ) -> Option<lsp::CallHierarchyOutgoingCall> {
-    let target_specifier = normalize_specifier(&self.to.file).ok()?;
-    let target_asset_or_doc = language_server
-      .get_asset_or_document(&target_specifier)
-      .await
-      .ok()?;
+    let target_specifier = resolve_url(&self.to.file).ok()?;
+    let target_asset_or_doc =
+      language_server.get_maybe_asset_or_document(&target_specifier)?;
 
     Some(lsp::CallHierarchyOutgoingCall {
       to: self.to.to_call_hierarchy_item(
@@ -1862,29 +2918,157 @@ impl CallHierarchyOutgoingCall {
   }
 }
 
-#[derive(Debug, Deserialize)]
+/// Used to convert completion code actions into a command and additional text
+/// edits to pass in the completion item.
+fn parse_code_actions(
+  maybe_code_actions: Option<&Vec<CodeAction>>,
+  data: &CompletionItemData,
+  specifier: &ModuleSpecifier,
+  language_server: &language_server::Inner,
+) -> Result<(Option<lsp::Command>, Option<Vec<lsp::TextEdit>>), AnyError> {
+  if let Some(code_actions) = maybe_code_actions {
+    let mut additional_text_edits: Vec<lsp::TextEdit> = Vec::new();
+    let mut has_remaining_commands_or_edits = false;
+    for ts_action in code_actions {
+      if ts_action.commands.is_some() {
+        has_remaining_commands_or_edits = true;
+      }
+
+      let asset_or_doc =
+        language_server.get_asset_or_document(&data.specifier)?;
+      for change in &ts_action.changes {
+        if data.specifier.as_str() == change.file_name {
+          additional_text_edits.extend(change.text_changes.iter().map(|tc| {
+            let mut text_edit = tc.as_text_edit(asset_or_doc.line_index());
+            if let Some(specifier_rewrite) = &data.specifier_rewrite {
+              text_edit.new_text = text_edit
+                .new_text
+                .replace(&specifier_rewrite.0, &specifier_rewrite.1);
+            }
+            text_edit
+          }));
+        } else {
+          has_remaining_commands_or_edits = true;
+        }
+      }
+    }
+
+    let mut command: Option<lsp::Command> = None;
+    if has_remaining_commands_or_edits {
+      let actions: Vec<Value> = code_actions
+        .iter()
+        .map(|ca| {
+          let changes: Vec<FileTextChanges> = ca
+            .changes
+            .clone()
+            .into_iter()
+            .filter(|ch| ch.file_name == data.specifier.as_str())
+            .collect();
+          json!({
+            "commands": ca.commands,
+            "description": ca.description,
+            "changes": changes,
+          })
+        })
+        .collect();
+      command = Some(lsp::Command {
+        title: "".to_string(),
+        command: "_typescript.applyCompletionCodeAction".to_string(),
+        arguments: Some(vec![json!(specifier.to_string()), json!(actions)]),
+      });
+    }
+
+    if additional_text_edits.is_empty() {
+      Ok((command, None))
+    } else {
+      Ok((command, Some(additional_text_edits)))
+    }
+  } else {
+    Ok((None, None))
+  }
+}
+
+// Based on https://github.com/microsoft/vscode/blob/1.81.1/extensions/typescript-language-features/src/languageFeatures/util/snippetForFunctionCall.ts#L49.
+fn get_parameters_from_parts(parts: &[SymbolDisplayPart]) -> Vec<String> {
+  let mut parameters = Vec::with_capacity(3);
+  let mut is_in_fn = false;
+  let mut paren_count = 0;
+  let mut brace_count = 0;
+  for (idx, part) in parts.iter().enumerate() {
+    if ["methodName", "functionName", "text", "propertyName"]
+      .contains(&part.kind.as_str())
+    {
+      if paren_count == 0 && brace_count == 0 {
+        is_in_fn = true;
+      }
+    } else if part.kind == "parameterName" {
+      if paren_count == 1 && brace_count == 0 && is_in_fn {
+        let is_optional =
+          matches!(parts.get(idx + 1), Some(next) if next.text == "?");
+        // Skip `this` and optional parameters.
+        if !is_optional && part.text != "this" {
+          parameters.push(part.text.clone());
+        }
+      }
+    } else if part.kind == "punctuation" {
+      if part.text == "(" {
+        paren_count += 1;
+      } else if part.text == ")" {
+        paren_count -= 1;
+        if paren_count <= 0 && is_in_fn {
+          break;
+        }
+      } else if part.text == "..." && paren_count == 1 {
+        // Found rest parmeter. Do not fill in any further arguments.
+        break;
+      } else if part.text == "{" {
+        brace_count += 1;
+      } else if part.text == "}" {
+        brace_count -= 1;
+      }
+    }
+  }
+  parameters
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionEntryDetails {
-  // name: String,
-  // kind: ScriptElementKind,
-  // kind_modifiers: String,
   display_parts: Vec<SymbolDisplayPart>,
   documentation: Option<Vec<SymbolDisplayPart>>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   tags: Option<Vec<JsDocTagInfo>>,
-  // code_actions: Option<Vec<CodeAction>>,
-  // source: Option<Vec<SymbolDisplayPart>>,
+  name: String,
+  kind: ScriptElementKind,
+  kind_modifiers: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  code_actions: Option<Vec<CodeAction>>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  source_display: Option<Vec<SymbolDisplayPart>>,
 }
 
 impl CompletionEntryDetails {
+  fn normalize(
+    &mut self,
+    specifier_map: &TscSpecifierMap,
+  ) -> Result<(), AnyError> {
+    for action in self.code_actions.iter_mut().flatten() {
+      action.normalize(specifier_map)?;
+    }
+    Ok(())
+  }
+
   pub fn as_completion_item(
     &self,
     original_item: &lsp::CompletionItem,
+    data: &CompletionItemData,
+    specifier: &ModuleSpecifier,
     language_server: &language_server::Inner,
-  ) -> lsp::CompletionItem {
+  ) -> Result<lsp::CompletionItem, AnyError> {
     let detail = if original_item.detail.is_some() {
       original_item.detail.clone()
     } else if !self.display_parts.is_empty() {
-      Some(replace_links(&display_parts_to_string(
+      Some(replace_links(display_parts_to_string(
         &self.display_parts,
         language_server,
       )))
@@ -1899,7 +3083,7 @@ impl CompletionEntryDetails {
           .map(|tag_info| get_tag_documentation(tag_info, language_server))
           .collect::<Vec<String>>()
           .join("");
-        value = format!("{}\n\n{}", value, tag_documentation);
+        value = format!("{value}\n\n{tag_documentation}");
       }
       Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {
         kind: lsp::MarkupKind::Markdown,
@@ -1908,15 +3092,38 @@ impl CompletionEntryDetails {
     } else {
       None
     };
-    // TODO(@kitsonk) add `self.code_actions`
-    // TODO(@kitsonk) add `use_code_snippet`
+    let (command, additional_text_edits) = parse_code_actions(
+      self.code_actions.as_ref(),
+      data,
+      specifier,
+      language_server,
+    )?;
+    let insert_text = if data.use_code_snippet {
+      Some(format!(
+        "{}({})",
+        original_item
+          .insert_text
+          .as_ref()
+          .unwrap_or(&original_item.label),
+        get_parameters_from_parts(&self.display_parts).join(", "),
+      ))
+    } else {
+      original_item.insert_text.clone()
+    };
 
-    lsp::CompletionItem {
+    Ok(lsp::CompletionItem {
       data: None,
       detail,
       documentation,
+      command,
+      additional_text_edits,
+      insert_text,
+      // NOTE(bartlomieju): it's not entirely clear to me why we need to do that,
+      // but when `completionItem/resolve` is called, we get a list of commit chars
+      // even though we might have returned an empty list in `completion` request.
+      commit_characters: None,
       ..original_item.clone()
-    }
+    })
   }
 }
 
@@ -1924,6 +3131,9 @@ impl CompletionEntryDetails {
 #[serde(rename_all = "camelCase")]
 pub struct CompletionInfo {
   entries: Vec<CompletionEntry>,
+  // this is only used by Microsoft's telemetrics, which Deno doesn't use and
+  // there are issues with the value not matching the type definitions.
+  // flags: Option<CompletionInfoFlags>,
   is_global_completion: bool,
   is_member_completion: bool,
   is_new_identifier_location: bool,
@@ -1938,6 +3148,7 @@ impl CompletionInfo {
     settings: &config::CompletionSettings,
     specifier: &ModuleSpecifier,
     position: u32,
+    language_server: &language_server::Inner,
   ) -> lsp::CompletionResponse {
     let items = self
       .entries
@@ -1949,6 +3160,7 @@ impl CompletionInfo {
           settings,
           specifier,
           position,
+          language_server,
         )
       })
       .collect();
@@ -1979,9 +3191,21 @@ pub struct CompletionItemData {
   pub name: String,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub source: Option<String>,
+  /// If present, the code action / text edit corresponding to this item should
+  /// be rewritten by replacing the first string with the second. Intended for
+  /// auto-import specifiers to be reverse-import-mapped.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub specifier_rewrite: Option<(String, String)>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub data: Option<Value>,
   pub use_code_snippet: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompletionEntryDataImport {
+  module_specifier: String,
+  file_name: String,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -1995,15 +3219,25 @@ pub struct CompletionEntry {
   #[serde(skip_serializing_if = "Option::is_none")]
   insert_text: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
+  is_snippet: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   replacement_span: Option<TextSpan>,
   #[serde(skip_serializing_if = "Option::is_none")]
   has_action: Option<bool>,
   #[serde(skip_serializing_if = "Option::is_none")]
   source: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
+  source_display: Option<Vec<SymbolDisplayPart>>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  label_details: Option<CompletionEntryLabelDetails>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   is_recommended: Option<bool>,
   #[serde(skip_serializing_if = "Option::is_none")]
   is_from_unchecked_file: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  is_package_json_import: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  is_import_statement_completion: Option<bool>,
   #[serde(skip_serializing_if = "Option::is_none")]
   data: Option<Value>,
 }
@@ -2068,7 +3302,7 @@ impl CompletionEntry {
           return Some(insert_text.clone());
         }
       } else {
-        return Some(self.name.replace('#', ""));
+        return None;
       }
     }
 
@@ -2095,24 +3329,30 @@ impl CompletionEntry {
     settings: &config::CompletionSettings,
     specifier: &ModuleSpecifier,
     position: u32,
+    language_server: &language_server::Inner,
   ) -> lsp::CompletionItem {
     let mut label = self.name.clone();
+    let mut label_details: Option<lsp::CompletionItemLabelDetails> = None;
     let mut kind: Option<lsp::CompletionItemKind> =
       Some(self.kind.clone().into());
+    let mut specifier_rewrite = None;
 
-    let sort_text = if self.source.is_some() {
-      Some(format!("\u{ffff}{}", self.sort_text))
+    let mut sort_text = if self.source.is_some() {
+      format!("\u{ffff}{}", self.sort_text)
     } else {
-      Some(self.sort_text.clone())
+      self.sort_text.clone()
     };
 
     let preselect = self.is_recommended;
     let use_code_snippet = settings.complete_function_calls
       && (kind == Some(lsp::CompletionItemKind::FUNCTION)
         || kind == Some(lsp::CompletionItemKind::METHOD));
-    // TODO(@kitsonk) missing from types: https://github.com/gluon-lang/lsp-types/issues/204
-    let _commit_characters = self.get_commit_characters(info, settings);
+    let commit_characters = self.get_commit_characters(info, settings);
     let mut insert_text = self.insert_text.clone();
+    let insert_text_format = match self.is_snippet {
+      Some(true) => Some(lsp::InsertTextFormat::SNIPPET),
+      _ => None,
+    };
     let range = self.replacement_span.clone();
     let mut filter_text = self.get_filter_text();
     let mut tags = None;
@@ -2149,6 +3389,39 @@ impl CompletionEntry {
       }
     }
 
+    if let Some(source) = &self.source {
+      let mut display_source = source.clone();
+      if let Some(data) = &self.data {
+        if let Ok(import_data) =
+          serde_json::from_value::<CompletionEntryDataImport>(data.clone())
+        {
+          if let Ok(import_specifier) = resolve_url(&import_data.file_name) {
+            if let Some(new_module_specifier) = language_server
+              .get_ts_response_import_mapper()
+              .check_specifier(&import_specifier, specifier)
+              .or_else(|| relative_specifier(specifier, &import_specifier))
+            {
+              display_source = new_module_specifier.clone();
+              if new_module_specifier != import_data.module_specifier {
+                specifier_rewrite =
+                  Some((import_data.module_specifier, new_module_specifier));
+              }
+            }
+          }
+        }
+      }
+      // We want relative or bare (import-mapped or otherwise) specifiers to
+      // appear at the top.
+      if resolve_url(&display_source).is_err() {
+        sort_text += "_0";
+      } else {
+        sort_text += "_1";
+      }
+      label_details
+        .get_or_insert_with(Default::default)
+        .description = Some(display_source);
+    }
+
     let text_edit =
       if let (Some(text_span), Some(new_text)) = (range, &insert_text) {
         let range = text_span.to_range(line_index);
@@ -2167,26 +3440,37 @@ impl CompletionEntry {
       position,
       name: self.name.clone(),
       source: self.source.clone(),
+      specifier_rewrite,
       data: self.data.clone(),
       use_code_snippet,
     };
 
     lsp::CompletionItem {
       label,
+      label_details,
       kind,
-      sort_text,
+      sort_text: Some(sort_text),
       preselect,
       text_edit,
       filter_text,
       insert_text,
+      insert_text_format,
       detail,
       tags,
-      data: Some(json!({
-        "tsc": tsc,
-      })),
+      commit_characters,
+      data: Some(json!({ "tsc": tsc })),
       ..Default::default()
     }
   }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompletionEntryLabelDetails {
+  #[serde(skip_serializing_if = "Option::is_none")]
+  detail: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2240,6 +3524,7 @@ impl OutliningSpan {
         Some(range.end.character)
       },
       kind: self.get_folding_range_kind(&self.kind),
+      collapsed_text: None,
     }
   }
 
@@ -2333,7 +3618,7 @@ impl SignatureHelpItem {
     let documentation =
       display_parts_to_string(&self.documentation, language_server);
     lsp::SignatureInformation {
-      label: format!("{}{}{}", prefix_text, params_text, suffix_text),
+      label: format!("{prefix_text}{params_text}{suffix_text}"),
       documentation: Some(lsp::Documentation::MarkupContent(
         lsp::MarkupContent {
           kind: lsp::MarkupKind::Markdown,
@@ -2411,19 +3696,85 @@ struct Response {
   data: Value,
 }
 
-struct State<'a> {
+#[derive(Debug, Default)]
+pub struct TscSpecifierMap {
+  normalized_specifiers: DashMap<String, ModuleSpecifier>,
+  denormalized_specifiers: DashMap<ModuleSpecifier, String>,
+}
+
+impl TscSpecifierMap {
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  /// Convert the specifier to one compatible with tsc. Cache the resulting
+  /// mapping in case it needs to be reversed.
+  // TODO(nayeemrmn): Factor in out-of-band media type here.
+  pub fn denormalize(&self, specifier: &ModuleSpecifier) -> String {
+    let original = specifier;
+    if let Some(specifier) = self.denormalized_specifiers.get(original) {
+      return specifier.to_string();
+    }
+    let mut specifier = if let Some(s) = file_like_to_file_specifier(original) {
+      s.to_string()
+    } else {
+      original.to_string()
+    };
+    let media_type = if original.scheme() == "deno-notebook-cell" {
+      MediaType::TypeScript
+    } else {
+      MediaType::from_specifier(original)
+    };
+    // If the URL-inferred media type doesn't correspond to tsc's path-inferred
+    // media type, force it to be the same by appending an extension.
+    if MediaType::from_path(Path::new(specifier.as_str())) != media_type {
+      specifier += media_type.as_ts_extension();
+    }
+    if specifier != original.as_str() {
+      self
+        .normalized_specifiers
+        .insert(specifier.clone(), original.clone());
+    }
+    specifier
+  }
+
+  /// Convert the specifier from one compatible with tsc. Cache the resulting
+  /// mapping in case it needs to be reversed.
+  pub fn normalize<S: AsRef<str>>(
+    &self,
+    specifier: S,
+  ) -> Result<ModuleSpecifier, AnyError> {
+    let original = specifier.as_ref();
+    if let Some(specifier) = self.normalized_specifiers.get(original) {
+      return Ok(specifier.clone());
+    }
+    let specifier_str = original.replace(".d.ts.d.ts", ".d.ts");
+    let specifier = match ModuleSpecifier::parse(&specifier_str) {
+      Ok(s) => s,
+      Err(err) => return Err(err.into()),
+    };
+    if specifier.as_str() != original {
+      self
+        .denormalized_specifiers
+        .insert(specifier.clone(), original.to_string());
+    }
+    Ok(specifier)
+  }
+}
+
+struct State {
   last_id: usize,
   performance: Arc<Performance>,
   response: Option<Response>,
   state_snapshot: Arc<StateSnapshot>,
-  snapshots: HashMap<(ModuleSpecifier, Cow<'a, str>), String>,
-  specifiers: HashMap<String, String>,
+  specifier_map: Arc<TscSpecifierMap>,
   token: CancellationToken,
 }
 
-impl<'a> State<'a> {
+impl State {
   fn new(
     state_snapshot: Arc<StateSnapshot>,
+    specifier_map: Arc<TscSpecifierMap>,
     performance: Arc<Performance>,
   ) -> Self {
     Self {
@@ -2431,92 +3782,41 @@ impl<'a> State<'a> {
       performance,
       response: None,
       state_snapshot,
-      snapshots: HashMap::default(),
-      specifiers: HashMap::default(),
+      specifier_map,
       token: Default::default(),
     }
   }
 
-  /// If a normalized version of the specifier has been stored for tsc, this
-  /// will "restore" it for communicating back to the tsc language server,
-  /// otherwise it will just convert the specifier to a string.
-  fn denormalize_specifier(&self, specifier: &ModuleSpecifier) -> String {
-    let specifier_str = specifier.to_string();
-    self
-      .specifiers
-      .get(&specifier_str)
-      .unwrap_or(&specifier_str)
-      .to_string()
-  }
-
-  /// In certain situations, tsc can request "invalid" specifiers and this will
-  /// normalize and memoize the specifier.
-  fn normalize_specifier<S: AsRef<str>>(
-    &mut self,
-    specifier: S,
-  ) -> Result<ModuleSpecifier, AnyError> {
-    let specifier_str = specifier.as_ref().replace(".d.ts.d.ts", ".d.ts");
-    if specifier_str != specifier.as_ref() {
-      self
-        .specifiers
-        .insert(specifier_str.clone(), specifier.as_ref().to_string());
+  fn get_asset_or_document(
+    &self,
+    specifier: &ModuleSpecifier,
+  ) -> Option<AssetOrDocument> {
+    let snapshot = &self.state_snapshot;
+    if specifier.scheme() == "asset" {
+      snapshot.assets.get(specifier).map(AssetOrDocument::Asset)
+    } else {
+      snapshot
+        .documents
+        .get(specifier)
+        .map(AssetOrDocument::Document)
     }
-    ModuleSpecifier::parse(&specifier_str).map_err(|err| err.into())
   }
-}
 
-/// If a snapshot is missing from the state cache, add it.
-fn cache_snapshot(
-  state: &mut State,
-  specifier: &ModuleSpecifier,
-  version: String,
-) -> Result<(), AnyError> {
-  if !state
-    .snapshots
-    .contains_key(&(specifier.clone(), version.clone().into()))
-  {
-    let content = state
-      .state_snapshot
-      .documents
-      .get(specifier)
-      .ok_or_else(|| {
-        anyhow!("Specifier unexpectedly doesn't exist: {}", specifier)
-      })?
-      .content();
-    state
-      .snapshots
-      .insert((specifier.clone(), version.into()), content.to_string());
+  fn script_version(&self, specifier: &ModuleSpecifier) -> Option<String> {
+    if specifier.scheme() == "asset" {
+      if self.state_snapshot.assets.contains_key(specifier) {
+        Some("1".to_string())
+      } else {
+        None
+      }
+    } else {
+      self
+        .state_snapshot
+        .documents
+        .get(specifier)
+        .map(|d| d.script_version())
+    }
   }
-  Ok(())
-}
-
-fn normalize_specifier<S: AsRef<str>>(
-  specifier: S,
-) -> Result<ModuleSpecifier, AnyError> {
-  resolve_url(specifier.as_ref().replace(".d.ts.d.ts", ".d.ts").as_str())
-    .map_err(|err| err.into())
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SourceSnapshotArgs {
-  specifier: String,
-  version: String,
-}
-
-/// The language service is dropping a reference to a source file snapshot, and
-/// we can drop our version of that document.
-#[op]
-fn op_dispose(
-  state: &mut OpState,
-  args: SourceSnapshotArgs,
-) -> Result<bool, AnyError> {
-  let state = state.borrow_mut::<State>();
-  let mark = state.performance.mark("op_dispose", Some(&args));
-  let specifier = state.normalize_specifier(&args.specifier)?;
-  state.snapshots.remove(&(specifier, args.version.into()));
-  state.performance.measure(mark);
-  Ok(true)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2525,217 +3825,158 @@ struct SpecifierArgs {
   specifier: String,
 }
 
-#[op]
-fn op_exists(
-  state: &mut OpState,
-  args: SpecifierArgs,
-) -> Result<bool, AnyError> {
+#[op2(fast)]
+fn op_is_cancelled(state: &mut OpState) -> bool {
   let state = state.borrow_mut::<State>();
-  // we don't measure the performance of op_exists anymore because as of TS 4.5
-  // it is noisy with all the checking for custom libs, that we can't see the
-  // forrest for the trees as well as it compounds any lsp performance
-  // challenges, opening a single document in the editor causes some 3k worth
-  // of op_exists requests... :omg:
-  let specifier = match state.normalize_specifier(&args.specifier) {
-    Ok(url) => url,
-    // sometimes tsc tries to query invalid specifiers, especially when
-    // something else isn't quite right, so instead of bubbling up the error
-    // back to tsc, we simply swallow it and say the file doesn't exist
-    Err(_) => return Ok(false),
-  };
-  let result = state.state_snapshot.documents.exists(&specifier);
-  Ok(result)
+  state.token.is_cancelled()
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[op2(fast)]
+fn op_is_node_file(state: &mut OpState, #[string] path: String) -> bool {
+  let state = state.borrow::<State>();
+  match ModuleSpecifier::parse(&path) {
+    Ok(specifier) => state
+      .state_snapshot
+      .npm
+      .as_ref()
+      .map(|n| n.npm_resolver.in_npm_package(&specifier))
+      .unwrap_or(false),
+    Err(_) => false,
+  }
+}
+
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GetChangeRangeArgs {
-  specifier: String,
-  old_length: u32,
-  old_version: String,
-  version: String,
+struct LoadResponse {
+  data: Arc<str>,
+  script_kind: i32,
+  version: Option<String>,
 }
 
-/// The language service wants to compare an old snapshot with a new snapshot to
-/// determine what source has changed.
-#[op]
-fn op_get_change_range(
-  state: &mut OpState,
-  args: GetChangeRangeArgs,
-) -> Result<Value, AnyError> {
-  let state = state.borrow_mut::<State>();
-  let mark = state.performance.mark("op_get_change_range", Some(&args));
-  let specifier = state.normalize_specifier(&args.specifier)?;
-  cache_snapshot(state, &specifier, args.version.clone())?;
-  let r = if let Some(current) = state
-    .snapshots
-    .get(&(specifier.clone(), args.version.clone().into()))
-  {
-    if let Some(prev) = state
-      .snapshots
-      .get(&(specifier, args.old_version.clone().into()))
-    {
-      Ok(text::get_range_change(prev, current))
-    } else {
-      let new_length = current.encode_utf16().count();
-      // when a local file is opened up in the editor, the compiler might
-      // already have a snapshot of it in memory, and will request it, but we
-      // now are working off in memory versions of the document, and so need
-      // to tell tsc to reset the whole document
-      Ok(json!({
-        "span": {
-          "start": 0,
-          "length": args.old_length,
-        },
-        "newLength": new_length,
-      }))
-    }
-  } else {
-    Err(custom_error(
-      "MissingSnapshot",
-      format!(
-        "The current snapshot version is missing.\n  Args: \"{:?}\"",
-        args
-      ),
-    ))
-  };
-
-  state.performance.measure(mark);
-  r
-}
-
-#[op]
-fn op_get_length(
-  state: &mut OpState,
-  args: SourceSnapshotArgs,
-) -> Result<usize, AnyError> {
-  let state = state.borrow_mut::<State>();
-  let mark = state.performance.mark("op_get_length", Some(&args));
-  let specifier = state.normalize_specifier(args.specifier)?;
-  let r = if let Some(Some(asset)) =
-    state.state_snapshot.assets.get_cached(&specifier)
-  {
-    Ok(asset.length())
-  } else {
-    cache_snapshot(state, &specifier, args.version.clone())?;
-    let content = state
-      .snapshots
-      .get(&(specifier, args.version.into()))
-      .unwrap();
-    Ok(content.encode_utf16().count())
-  };
-  state.performance.measure(mark);
-  r
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GetTextArgs {
-  specifier: String,
-  version: String,
-  start: usize,
-  end: usize,
-}
-
-#[op]
-fn op_get_text(
-  state: &mut OpState,
-  args: GetTextArgs,
-) -> Result<String, AnyError> {
-  let state = state.borrow_mut::<State>();
-  let mark = state.performance.mark("op_get_text", Some(&args));
-  let specifier = state.normalize_specifier(args.specifier)?;
-  let maybe_asset = state.state_snapshot.assets.get_cached(&specifier);
-  let content = if let Some(Some(content)) = &maybe_asset {
-    content.text_str()
-  } else {
-    cache_snapshot(state, &specifier, args.version.clone())?;
-    state
-      .snapshots
-      .get(&(specifier, args.version.into()))
-      .unwrap()
-  };
-  state.performance.measure(mark);
-  Ok(text::slice(content, args.start..args.end).to_string())
-}
-
-#[op]
-fn op_is_cancelled(state: &mut OpState) -> Result<bool, AnyError> {
-  let state = state.borrow_mut::<State>();
-  Ok(state.token.is_cancelled())
-}
-
-#[op]
+#[op2]
+#[serde]
 fn op_load(
   state: &mut OpState,
-  args: SpecifierArgs,
-) -> Result<Option<String>, AnyError> {
+  #[serde] args: SpecifierArgs,
+) -> Result<Option<LoadResponse>, AnyError> {
   let state = state.borrow_mut::<State>();
   let mark = state.performance.mark("op_load", Some(&args));
-  let specifier = state.normalize_specifier(args.specifier)?;
-  let document = state.state_snapshot.documents.get(&specifier);
+  let specifier = state.specifier_map.normalize(args.specifier)?;
+  if specifier.as_str() == "internal:///missing_dependency.d.ts" {
+    return Ok(Some(LoadResponse {
+      data: Arc::from("declare const __: any;\nexport = __;\n"),
+      script_kind: crate::tsc::as_ts_script_kind(MediaType::Dts),
+      version: Some("1".to_string()),
+    }));
+  }
+  let asset_or_document = state.get_asset_or_document(&specifier);
   state.performance.measure(mark);
-  Ok(document.map(|d| d.content().to_string()))
+  Ok(asset_or_document.map(|doc| LoadResponse {
+    data: doc.text(),
+    script_kind: crate::tsc::as_ts_script_kind(doc.media_type()),
+    version: state.script_version(&specifier),
+  }))
 }
 
-#[op]
+#[op2]
+#[serde]
 fn op_resolve(
   state: &mut OpState,
-  args: ResolveArgs,
+  #[serde] args: ResolveArgs,
 ) -> Result<Vec<Option<(String, String)>>, AnyError> {
   let state = state.borrow_mut::<State>();
   let mark = state.performance.mark("op_resolve", Some(&args));
-  let referrer = state.normalize_specifier(&args.base)?;
-
-  let result = if let Some(resolved) = state
-    .state_snapshot
-    .documents
-    .resolve(args.specifiers, &referrer)
-  {
-    Ok(
-      resolved
-        .into_iter()
-        .map(|o| {
-          o.map(|(s, mt)| (s.to_string(), mt.as_ts_extension().to_string()))
-        })
-        .collect(),
-    )
-  } else {
-    Err(custom_error(
-      "NotFound",
-      format!(
+  let referrer = state.specifier_map.normalize(&args.base)?;
+  let result = match state.get_asset_or_document(&referrer) {
+    Some(referrer_doc) => {
+      let resolved = state.state_snapshot.documents.resolve(
+        args.specifiers,
+        &referrer_doc,
+        state.state_snapshot.npm.as_ref(),
+      );
+      Ok(
+        resolved
+          .into_iter()
+          .map(|o| {
+            o.map(|(s, mt)| {
+              (
+                state.specifier_map.denormalize(&s),
+                mt.as_ts_extension().to_string(),
+              )
+            })
+          })
+          .collect(),
+      )
+    }
+    None => {
+      lsp_warn!(
         "Error resolving. Referring specifier \"{}\" was not found.",
         args.base
-      ),
-    ))
+      );
+      Ok(vec![None; args.specifiers.len()])
+    }
   };
 
   state.performance.measure(mark);
   result
 }
 
-#[op]
-fn op_respond(state: &mut OpState, args: Response) -> Result<bool, AnyError> {
+#[op2]
+fn op_respond(state: &mut OpState, #[serde] args: Response) {
   let state = state.borrow_mut::<State>();
   state.response = Some(args);
-  Ok(true)
 }
 
-#[op]
-fn op_script_names(
-  state: &mut OpState,
-  _args: Value,
-) -> Result<Vec<ModuleSpecifier>, AnyError> {
+#[op2]
+#[serde]
+fn op_script_names(state: &mut OpState) -> Vec<String> {
   let state = state.borrow_mut::<State>();
-  Ok(
-    state
-      .state_snapshot
-      .documents
-      .documents(true, true)
-      .into_iter()
-      .map(|d| d.specifier().clone())
-      .collect(),
-  )
+  let documents = &state.state_snapshot.documents;
+  let all_docs = documents.documents(DocumentsFilter::AllDiagnosable);
+  let mut seen = HashSet::new();
+  let mut result = Vec::new();
+
+  if documents.has_injected_types_node_package() {
+    // ensure this is first so it resolves the node types first
+    let specifier = "asset:///node_types.d.ts";
+    result.push(specifier.to_string());
+    seen.insert(specifier);
+  }
+
+  // inject these next because they're global
+  for import in documents.module_graph_imports() {
+    if seen.insert(import.as_str()) {
+      result.push(import.to_string());
+    }
+  }
+
+  // finally include the documents and all their dependencies
+  for doc in &all_docs {
+    let specifiers = std::iter::once(doc.specifier()).chain(
+      doc
+        .dependencies()
+        .values()
+        .filter_map(|dep| dep.get_type().or_else(|| dep.get_code())),
+    );
+    for specifier in specifiers {
+      if seen.insert(specifier.as_str()) {
+        if let Some(specifier) = documents.resolve_redirected(specifier) {
+          // only include dependencies we know to exist otherwise typescript will error
+          if documents.exists(&specifier) {
+            result.push(specifier.to_string());
+          }
+        }
+      }
+    }
+  }
+
+  result
+    .into_iter()
+    .map(|s| match ModuleSpecifier::parse(&s) {
+      Ok(s) => state.specifier_map.denormalize(&s),
+      Err(_) => s,
+    })
+    .collect()
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2744,102 +3985,99 @@ struct ScriptVersionArgs {
   specifier: String,
 }
 
-#[op]
+#[op2]
+#[string]
 fn op_script_version(
   state: &mut OpState,
-  args: ScriptVersionArgs,
+  #[serde] args: ScriptVersionArgs,
 ) -> Result<Option<String>, AnyError> {
   let state = state.borrow_mut::<State>();
   // this op is very "noisy" and measuring its performance is not useful, so we
   // don't measure it uniquely anymore.
-  let specifier = state.normalize_specifier(args.specifier)?;
-  if specifier.scheme() == "asset" {
-    if state.state_snapshot.assets.contains_key(&specifier) {
-      Ok(Some("1".to_string()))
-    } else {
-      Ok(None)
-    }
-  } else {
-    let script_version = state
-      .state_snapshot
-      .documents
-      .get(&specifier)
-      .map(|d| d.script_version());
-    Ok(script_version)
-  }
+  let specifier = state.specifier_map.normalize(args.specifier)?;
+  Ok(state.script_version(&specifier))
 }
 
 /// Create and setup a JsRuntime based on a snapshot. It is expected that the
 /// supplied snapshot is an isolate that contains the TypeScript language
 /// server.
-fn js_runtime(performance: Arc<Performance>) -> JsRuntime {
+fn js_runtime(
+  performance: Arc<Performance>,
+  cache: Arc<dyn HttpCache>,
+  specifier_map: Arc<TscSpecifierMap>,
+) -> JsRuntime {
   JsRuntime::new(RuntimeOptions {
-    extensions: vec![init_extension(performance)],
+    extensions: vec![deno_tsc::init_ops(performance, cache, specifier_map)],
     startup_snapshot: Some(tsc::compiler_snapshot()),
     ..Default::default()
   })
 }
 
-fn init_extension(performance: Arc<Performance>) -> Extension {
-  Extension::builder()
-    .ops(vec![
-      op_dispose::decl(),
-      op_exists::decl(),
-      op_get_change_range::decl(),
-      op_get_length::decl(),
-      op_get_text::decl(),
-      op_is_cancelled::decl(),
-      op_load::decl(),
-      op_resolve::decl(),
-      op_respond::decl(),
-      op_script_names::decl(),
-      op_script_version::decl(),
-    ])
-    .state(move |state| {
-      state.put(State::new(
-        Arc::new(StateSnapshot::default()),
-        performance.clone(),
-      ));
-      Ok(())
-    })
-    .build()
-}
+deno_core::extension!(deno_tsc,
+  ops = [
+    op_is_cancelled,
+    op_is_node_file,
+    op_load,
+    op_resolve,
+    op_respond,
+    op_script_names,
+    op_script_version,
+  ],
+  options = {
+    performance: Arc<Performance>,
+    cache: Arc<dyn HttpCache>,
+    specifier_map: Arc<TscSpecifierMap>,
+  },
+  state = |state, options| {
+    state.put(State::new(
+      Arc::new(StateSnapshot {
+        assets: Default::default(),
+        cache_metadata: CacheMetadata::new(options.cache.clone()),
+        config: Default::default(),
+        documents: Documents::new(options.cache.clone()),
+        maybe_import_map: None,
+        npm: None,
+      }),
+      options.specifier_map,
+      options.performance,
+    ));
+  },
+);
 
 /// Instruct a language server runtime to start the language server and provide
 /// it with a minimal bootstrap configuration.
-fn start(
-  runtime: &mut JsRuntime,
-  debug: bool,
-  state_snapshot: &StateSnapshot,
-) -> Result<(), AnyError> {
-  let root_uri = state_snapshot
-    .root_uri
-    .clone()
-    .unwrap_or_else(|| Url::parse("cache:///").unwrap());
-  let init_config = json!({ "debug": debug, "rootUri": root_uri });
-  let init_src = format!("globalThis.serverInit({});", init_config);
+fn start(runtime: &mut JsRuntime, debug: bool) -> Result<(), AnyError> {
+  let init_config = json!({ "debug": debug });
+  let init_src = format!("globalThis.serverInit({init_config});");
 
-  runtime.execute_script(&located_script_name!(), &init_src)?;
+  runtime.execute_script(located_script_name!(), init_src.into())?;
   Ok(())
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "kebab-case")]
-#[allow(dead_code)]
-pub enum QuotePreference {
-  Auto,
-  Double,
-  Single,
+#[derive(Debug, Deserialize_repr, Serialize_repr)]
+#[repr(u32)]
+pub enum CompletionTriggerKind {
+  Invoked = 1,
+  TriggerCharacter = 2,
+  TriggerForIncompleteCompletions = 3,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "kebab-case")]
-#[allow(dead_code)]
-pub enum ImportModuleSpecifierPreference {
-  Auto,
-  Relative,
-  NonRelative,
+impl From<lsp::CompletionTriggerKind> for CompletionTriggerKind {
+  fn from(kind: lsp::CompletionTriggerKind) -> Self {
+    match kind {
+      lsp::CompletionTriggerKind::INVOKED => Self::Invoked,
+      lsp::CompletionTriggerKind::TRIGGER_CHARACTER => Self::TriggerCharacter,
+      lsp::CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS => {
+        Self::TriggerForIncompleteCompletions
+      }
+      _ => Self::Invoked,
+    }
+  }
 }
+
+pub type QuotePreference = config::QuoteStyle;
+
+pub type ImportModuleSpecifierPreference = config::ImportModuleSpecifier;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -2854,11 +4092,34 @@ pub enum ImportModuleSpecifierEnding {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 #[allow(dead_code)]
+pub enum IncludeInlayParameterNameHints {
+  None,
+  Literals,
+  All,
+}
+
+impl From<&config::InlayHintsParamNamesEnabled>
+  for IncludeInlayParameterNameHints
+{
+  fn from(setting: &config::InlayHintsParamNamesEnabled) -> Self {
+    match setting {
+      config::InlayHintsParamNamesEnabled::All => Self::All,
+      config::InlayHintsParamNamesEnabled::Literals => Self::Literals,
+      config::InlayHintsParamNamesEnabled::None => Self::None,
+    }
+  }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[allow(dead_code)]
 pub enum IncludePackageJsonAutoImports {
   Auto,
   On,
   Off,
 }
+
+pub type JsxAttributeCompletionStyle = config::JsxAttributeCompletionStyle;
 
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2867,6 +4128,8 @@ pub struct GetCompletionsAtPositionOptions {
   pub user_preferences: UserPreferences,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub trigger_character: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub trigger_kind: Option<CompletionTriggerKind>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -2887,6 +4150,12 @@ pub struct UserPreferences {
   #[serde(skip_serializing_if = "Option::is_none")]
   pub include_completions_with_insert_text: Option<bool>,
   #[serde(skip_serializing_if = "Option::is_none")]
+  pub include_completions_with_class_member_snippets: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub include_completions_with_object_literal_method_snippets: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub use_label_details_in_completion_entries: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub allow_incomplete_completions: Option<bool>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub import_module_specifier_preference:
@@ -2901,6 +4170,149 @@ pub struct UserPreferences {
   pub include_package_json_auto_imports: Option<IncludePackageJsonAutoImports>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub provide_refactor_not_applicable_reason: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub jsx_attribute_completion_style: Option<JsxAttributeCompletionStyle>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub include_inlay_parameter_name_hints:
+    Option<IncludeInlayParameterNameHints>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub include_inlay_parameter_name_hints_when_argument_matches_name:
+    Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub include_inlay_function_parameter_type_hints: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub include_inlay_variable_type_hints: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub include_inlay_variable_type_hints_when_type_matches_name: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub include_inlay_property_declaration_type_hints: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub include_inlay_function_like_return_type_hints: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub include_inlay_enum_member_value_hints: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub allow_rename_of_import_path: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub auto_import_file_exclude_patterns: Option<Vec<String>>,
+}
+
+impl UserPreferences {
+  pub fn from_config_for_specifier(
+    config: &config::Config,
+    fmt_config: &FmtOptionsConfig,
+    specifier: &ModuleSpecifier,
+  ) -> Self {
+    let base_preferences = Self {
+      allow_incomplete_completions: Some(true),
+      allow_text_changes_in_new_files: Some(specifier.scheme() == "file"),
+      // TODO(nayeemrmn): Investigate why we use `Index` here.
+      import_module_specifier_ending: Some(ImportModuleSpecifierEnding::Index),
+      include_completions_with_snippet_text: Some(
+        config.client_capabilities.snippet_support,
+      ),
+      provide_refactor_not_applicable_reason: Some(true),
+      quote_preference: Some(fmt_config.into()),
+      use_label_details_in_completion_entries: Some(true),
+      ..Default::default()
+    };
+    let Some(language_settings) =
+      config.language_settings_for_specifier(specifier)
+    else {
+      return base_preferences;
+    };
+    Self {
+      auto_import_file_exclude_patterns: Some(
+        language_settings
+          .preferences
+          .auto_import_file_exclude_patterns
+          .clone(),
+      ),
+      include_automatic_optional_chain_completions: Some(
+        language_settings.suggest.enabled
+          && language_settings
+            .suggest
+            .include_automatic_optional_chain_completions,
+      ),
+      include_completions_for_import_statements: Some(
+        language_settings.suggest.enabled
+          && language_settings
+            .suggest
+            .include_completions_for_import_statements,
+      ),
+      include_completions_for_module_exports: Some(
+        language_settings.suggest.enabled
+          && language_settings.suggest.auto_imports,
+      ),
+      include_completions_with_class_member_snippets: Some(
+        language_settings.suggest.enabled
+          && language_settings.suggest.class_member_snippets.enabled
+          && config.client_capabilities.snippet_support,
+      ),
+      include_completions_with_insert_text: Some(
+        language_settings.suggest.enabled,
+      ),
+      include_completions_with_object_literal_method_snippets: Some(
+        language_settings.suggest.enabled
+          && language_settings
+            .suggest
+            .object_literal_method_snippets
+            .enabled
+          && config.client_capabilities.snippet_support,
+      ),
+      import_module_specifier_preference: Some(
+        language_settings.preferences.import_module_specifier,
+      ),
+      include_inlay_parameter_name_hints: Some(
+        (&language_settings.inlay_hints.parameter_names.enabled).into(),
+      ),
+      include_inlay_parameter_name_hints_when_argument_matches_name: Some(
+        !language_settings
+          .inlay_hints
+          .parameter_names
+          .suppress_when_argument_matches_name,
+      ),
+      include_inlay_function_parameter_type_hints: Some(
+        language_settings.inlay_hints.parameter_types.enabled,
+      ),
+      include_inlay_variable_type_hints: Some(
+        language_settings.inlay_hints.variable_types.enabled,
+      ),
+      include_inlay_variable_type_hints_when_type_matches_name: Some(
+        !language_settings
+          .inlay_hints
+          .variable_types
+          .suppress_when_type_matches_name,
+      ),
+      include_inlay_property_declaration_type_hints: Some(
+        language_settings
+          .inlay_hints
+          .property_declaration_types
+          .enabled,
+      ),
+      include_inlay_function_like_return_type_hints: Some(
+        language_settings
+          .inlay_hints
+          .function_like_return_types
+          .enabled,
+      ),
+      include_inlay_enum_member_value_hints: Some(
+        language_settings.inlay_hints.enum_member_values.enabled,
+      ),
+      jsx_attribute_completion_style: Some(
+        language_settings.preferences.jsx_attribute_completion_style,
+      ),
+      provide_prefix_and_suffix_text_for_rename: Some(
+        language_settings.preferences.use_aliases_for_renames,
+      ),
+      // Only use workspace settings for quote style if there's no `deno.json`.
+      quote_preference: if config.has_config_file() {
+        base_preferences.quote_preference
+      } else {
+        Some(language_settings.preferences.quote_style)
+      },
+      ..base_preferences
+    }
+  }
 }
 
 #[derive(Debug, Serialize)]
@@ -2948,317 +4360,50 @@ pub struct GetCompletionDetailsArgs {
   pub position: u32,
   pub name: String,
   #[serde(skip_serializing_if = "Option::is_none")]
+  pub format_code_settings: Option<FormatCodeSettings>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub source: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub preferences: Option<UserPreferences>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub data: Option<Value>,
 }
 
-impl From<CompletionItemData> for GetCompletionDetailsArgs {
-  fn from(item_data: CompletionItemData) -> Self {
+impl From<&CompletionItemData> for GetCompletionDetailsArgs {
+  fn from(item_data: &CompletionItemData) -> Self {
     Self {
-      specifier: item_data.specifier,
+      specifier: item_data.specifier.clone(),
       position: item_data.position,
-      name: item_data.name,
-      source: item_data.source,
-      data: item_data.data,
+      name: item_data.name.clone(),
+      source: item_data.source.clone(),
+      preferences: None,
+      format_code_settings: None,
+      data: item_data.data.clone(),
     }
   }
 }
 
-/// Methods that are supported by the Language Service in the compiler isolate.
 #[derive(Debug)]
-pub enum RequestMethod {
-  /// Configure the compilation settings for the server.
-  Configure(TsConfig),
-  /// Get rename locations at a given position.
-  FindRenameLocations {
-    specifier: ModuleSpecifier,
-    position: u32,
-    find_in_strings: bool,
-    find_in_comments: bool,
-    provide_prefix_and_suffix_text_for_rename: bool,
-  },
-  /// Retrieve the text of an assets that exists in memory in the isolate.
-  GetAsset(ModuleSpecifier),
-  /// Retrieve the possible refactor info for a range of a file.
-  GetApplicableRefactors((ModuleSpecifier, TextSpan, String)),
-  /// Retrieve the refactor edit info for a range.
-  GetEditsForRefactor((ModuleSpecifier, TextSpan, String, String)),
-  /// Retrieve code fixes for a range of a file with the provided error codes.
-  GetCodeFixes((ModuleSpecifier, u32, u32, Vec<String>)),
-  /// Get completion information at a given position (IntelliSense).
-  GetCompletions((ModuleSpecifier, u32, GetCompletionsAtPositionOptions)),
-  /// Get details about a specific completion entry.
-  GetCompletionDetails(GetCompletionDetailsArgs),
-  /// Retrieve the combined code fixes for a fix id for a module.
-  GetCombinedCodeFix((ModuleSpecifier, Value)),
-  /// Get declaration information for a specific position.
-  GetDefinition((ModuleSpecifier, u32)),
-  /// Return diagnostics for given file.
-  GetDiagnostics(Vec<ModuleSpecifier>),
-  /// Return document highlights at position.
-  GetDocumentHighlights((ModuleSpecifier, u32, Vec<ModuleSpecifier>)),
-  /// Get semantic highlights information for a particular file.
-  GetEncodedSemanticClassifications((ModuleSpecifier, TextSpan)),
-  /// Get implementation information for a specific position.
-  GetImplementation((ModuleSpecifier, u32)),
-  /// Get "navigate to" items, which are converted to workspace symbols
-  GetNavigateToItems {
-    search: String,
-    max_result_count: Option<u32>,
-    file: Option<String>,
-  },
-  /// Get a "navigation tree" for a specifier.
-  GetNavigationTree(ModuleSpecifier),
-  /// Get outlining spans for a specifier.
-  GetOutliningSpans(ModuleSpecifier),
-  /// Return quick info at position (hover information).
-  GetQuickInfo((ModuleSpecifier, u32)),
-  /// Get document references for a specific position.
-  GetReferences((ModuleSpecifier, u32)),
-  /// Get signature help items for a specific position.
-  GetSignatureHelpItems((ModuleSpecifier, u32, SignatureHelpItemsOptions)),
-  /// Get a selection range for a specific position.
-  GetSmartSelectionRange((ModuleSpecifier, u32)),
-  /// Get the diagnostic codes that support some form of code fix.
-  GetSupportedCodeFixes,
-  /// Get the type definition information for a specific position.
-  GetTypeDefinition {
-    specifier: ModuleSpecifier,
-    position: u32,
-  },
-  /// Resolve a call hierarchy item for a specific position.
-  PrepareCallHierarchy((ModuleSpecifier, u32)),
-  /// Resolve incoming call hierarchy items for a specific position.
-  ProvideCallHierarchyIncomingCalls((ModuleSpecifier, u32)),
-  /// Resolve outgoing call hierarchy items for a specific position.
-  ProvideCallHierarchyOutgoingCalls((ModuleSpecifier, u32)),
+pub struct GetNavigateToItemsArgs {
+  pub search: String,
+  pub max_result_count: Option<u32>,
+  pub file: Option<String>,
 }
 
-impl RequestMethod {
-  fn to_value(&self, state: &State, id: usize) -> Value {
-    match self {
-      RequestMethod::Configure(config) => json!({
-        "id": id,
-        "method": "configure",
-        "compilerOptions": config,
-      }),
-      RequestMethod::FindRenameLocations {
-        specifier,
-        position,
-        find_in_strings,
-        find_in_comments,
-        provide_prefix_and_suffix_text_for_rename,
-      } => {
-        json!({
-          "id": id,
-          "method": "findRenameLocations",
-          "specifier": state.denormalize_specifier(specifier),
-          "position": position,
-          "findInStrings": find_in_strings,
-          "findInComments": find_in_comments,
-          "providePrefixAndSuffixTextForRename": provide_prefix_and_suffix_text_for_rename
-        })
-      }
-      RequestMethod::GetAsset(specifier) => json!({
-        "id": id,
-        "method": "getAsset",
-        "specifier": specifier,
-      }),
-      RequestMethod::GetApplicableRefactors((specifier, span, kind)) => json!({
-        "id": id,
-        "method": "getApplicableRefactors",
-        "specifier": state.denormalize_specifier(specifier),
-        "range": { "pos": span.start, "end": span.start + span.length },
-        "kind": kind,
-      }),
-      RequestMethod::GetEditsForRefactor((
-        specifier,
-        span,
-        refactor_name,
-        action_name,
-      )) => json!({
-        "id": id,
-        "method": "getEditsForRefactor",
-        "specifier": state.denormalize_specifier(specifier),
-        "range": { "pos": span.start, "end": span.start + span.length},
-        "refactorName": refactor_name,
-        "actionName": action_name,
-      }),
-      RequestMethod::GetCodeFixes((
-        specifier,
-        start_pos,
-        end_pos,
-        error_codes,
-      )) => json!({
-        "id": id,
-        "method": "getCodeFixes",
-        "specifier": state.denormalize_specifier(specifier),
-        "startPosition": start_pos,
-        "endPosition": end_pos,
-        "errorCodes": error_codes,
-      }),
-      RequestMethod::GetCombinedCodeFix((specifier, fix_id)) => json!({
-        "id": id,
-        "method": "getCombinedCodeFix",
-        "specifier": state.denormalize_specifier(specifier),
-        "fixId": fix_id,
-      }),
-      RequestMethod::GetCompletionDetails(args) => json!({
-        "id": id,
-        "method": "getCompletionDetails",
-        "args": args
-      }),
-      RequestMethod::GetCompletions((specifier, position, preferences)) => {
-        json!({
-          "id": id,
-          "method": "getCompletions",
-          "specifier": state.denormalize_specifier(specifier),
-          "position": position,
-          "preferences": preferences,
-        })
-      }
-      RequestMethod::GetDefinition((specifier, position)) => json!({
-        "id": id,
-        "method": "getDefinition",
-        "specifier": state.denormalize_specifier(specifier),
-        "position": position,
-      }),
-      RequestMethod::GetDiagnostics(specifiers) => json!({
-        "id": id,
-        "method": "getDiagnostics",
-        "specifiers": specifiers.iter().map(|s| state.denormalize_specifier(s)).collect::<Vec<String>>(),
-      }),
-      RequestMethod::GetDocumentHighlights((
-        specifier,
-        position,
-        files_to_search,
-      )) => json!({
-        "id": id,
-        "method": "getDocumentHighlights",
-        "specifier": state.denormalize_specifier(specifier),
-        "position": position,
-        "filesToSearch": files_to_search,
-      }),
-      RequestMethod::GetEncodedSemanticClassifications((specifier, span)) => {
-        json!({
-          "id": id,
-          "method": "getEncodedSemanticClassifications",
-          "specifier": state.denormalize_specifier(specifier),
-          "span": span,
-        })
-      }
-      RequestMethod::GetImplementation((specifier, position)) => json!({
-        "id": id,
-        "method": "getImplementation",
-        "specifier": state.denormalize_specifier(specifier),
-        "position": position,
-      }),
-      RequestMethod::GetNavigateToItems {
-        search,
-        max_result_count,
-        file,
-      } => json!({
-        "id": id,
-        "method": "getNavigateToItems",
-        "search": search,
-        "maxResultCount": max_result_count,
-        "file": file,
-      }),
-      RequestMethod::GetNavigationTree(specifier) => json!({
-        "id": id,
-        "method": "getNavigationTree",
-        "specifier": state.denormalize_specifier(specifier),
-      }),
-      RequestMethod::GetOutliningSpans(specifier) => json!({
-        "id": id,
-        "method": "getOutliningSpans",
-        "specifier": state.denormalize_specifier(specifier),
-      }),
-      RequestMethod::GetQuickInfo((specifier, position)) => json!({
-        "id": id,
-        "method": "getQuickInfo",
-        "specifier": state.denormalize_specifier(specifier),
-        "position": position,
-      }),
-      RequestMethod::GetReferences((specifier, position)) => json!({
-        "id": id,
-        "method": "getReferences",
-        "specifier": state.denormalize_specifier(specifier),
-        "position": position,
-      }),
-      RequestMethod::GetSignatureHelpItems((specifier, position, options)) => {
-        json!({
-          "id": id,
-          "method": "getSignatureHelpItems",
-          "specifier": state.denormalize_specifier(specifier),
-          "position": position,
-          "options": options,
-        })
-      }
-      RequestMethod::GetSmartSelectionRange((specifier, position)) => {
-        json!({
-          "id": id,
-          "method": "getSmartSelectionRange",
-          "specifier": state.denormalize_specifier(specifier),
-          "position": position
-        })
-      }
-      RequestMethod::GetSupportedCodeFixes => json!({
-        "id": id,
-        "method": "getSupportedCodeFixes",
-      }),
-      RequestMethod::GetTypeDefinition {
-        specifier,
-        position,
-      } => json!({
-        "id": id,
-        "method": "getTypeDefinition",
-        "specifier": state.denormalize_specifier(specifier),
-        "position": position
-      }),
-      RequestMethod::PrepareCallHierarchy((specifier, position)) => {
-        json!({
-          "id": id,
-          "method": "prepareCallHierarchy",
-          "specifier": state.denormalize_specifier(specifier),
-          "position": position
-        })
-      }
-      RequestMethod::ProvideCallHierarchyIncomingCalls((
-        specifier,
-        position,
-      )) => {
-        json!({
-          "id": id,
-          "method": "provideCallHierarchyIncomingCalls",
-          "specifier": state.denormalize_specifier(specifier),
-          "position": position
-        })
-      }
-      RequestMethod::ProvideCallHierarchyOutgoingCalls((
-        specifier,
-        position,
-      )) => {
-        json!({
-          "id": id,
-          "method": "provideCallHierarchyOutgoingCalls",
-          "specifier": state.denormalize_specifier(specifier),
-          "position": position
-        })
-      }
-    }
-  }
+#[derive(Clone, Debug)]
+struct TscRequest {
+  method: &'static str,
+  args: Value,
 }
 
 /// Send a request into a runtime and return the JSON value of the response.
-pub fn request(
+fn request(
   runtime: &mut JsRuntime,
   state_snapshot: Arc<StateSnapshot>,
-  method: RequestMethod,
+  request: TscRequest,
   token: CancellationToken,
 ) -> Result<Value, AnyError> {
-  let (performance, request_params) = {
+  let (performance, id) = {
     let op_state = runtime.op_state();
     let mut op_state = op_state.borrow_mut();
     let state = op_state.borrow_mut::<State>();
@@ -3266,11 +4411,19 @@ pub fn request(
     state.token = token;
     state.last_id += 1;
     let id = state.last_id;
-    (state.performance.clone(), method.to_value(state, id))
+    (state.performance.clone(), id)
   };
-  let mark = performance.mark("request", Some(request_params.clone()));
-  let request_src = format!("globalThis.serverRequest({});", request_params);
-  runtime.execute_script(&located_script_name!(), &request_src)?;
+  let mark =
+    performance.mark("request", Some((request.method, request.args.clone())));
+  assert!(
+    request.args.is_array(),
+    "Internal error: expected args to be array"
+  );
+  let request_src = format!(
+    "globalThis.serverRequest({id}, \"{}\", {});",
+    request.method, &request.args
+  );
+  runtime.execute_script(located_script_name!(), request_src.into())?;
 
   let op_state = runtime.op_state();
   let mut op_state = op_state.borrow_mut();
@@ -3291,59 +4444,65 @@ pub fn request(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::http_cache::HttpCache;
+  use crate::cache::GlobalHttpCache;
+  use crate::cache::HttpCache;
+  use crate::cache::RealDenoCacheEnv;
   use crate::http_util::HeadersMap;
+  use crate::lsp::cache::CacheMetadata;
+  use crate::lsp::config::WorkspaceSettings;
   use crate::lsp::documents::Documents;
   use crate::lsp::documents::LanguageId;
   use crate::lsp::text::LineIndex;
+  use pretty_assertions::assert_eq;
   use std::path::Path;
-  use std::path::PathBuf;
   use test_util::TempDir;
 
   fn mock_state_snapshot(
     fixtures: &[(&str, &str, i32, LanguageId)],
     location: &Path,
   ) -> StateSnapshot {
-    let mut documents = Documents::new(location);
+    let cache = Arc::new(GlobalHttpCache::new(
+      location.to_path_buf(),
+      RealDenoCacheEnv,
+    ));
+    let mut documents = Documents::new(cache.clone());
     for (specifier, source, version, language_id) in fixtures {
       let specifier =
         resolve_url(specifier).expect("failed to create specifier");
       documents.open(
         specifier.clone(),
         *version,
-        language_id.clone(),
-        Arc::new(source.to_string()),
+        *language_id,
+        (*source).into(),
       );
     }
     StateSnapshot {
       documents,
-      ..Default::default()
+      assets: Default::default(),
+      cache_metadata: CacheMetadata::new(cache),
+      config: Default::default(),
+      maybe_import_map: None,
+      npm: None,
     }
   }
 
-  fn setup(
+  async fn setup(
     temp_dir: &TempDir,
-    debug: bool,
     config: Value,
     sources: &[(&str, &str, i32, LanguageId)],
-  ) -> (JsRuntime, Arc<StateSnapshot>, PathBuf) {
-    let location = temp_dir.path().join("deps");
-    let state_snapshot = Arc::new(mock_state_snapshot(sources, &location));
-    let mut runtime = js_runtime(Default::default());
-    start(&mut runtime, debug, &state_snapshot)
-      .expect("could not start server");
+  ) -> (TsServer, Arc<StateSnapshot>, Arc<GlobalHttpCache>) {
+    let location = temp_dir.path().join("deps").to_path_buf();
+    let cache =
+      Arc::new(GlobalHttpCache::new(location.clone(), RealDenoCacheEnv));
+    let snapshot = Arc::new(mock_state_snapshot(sources, &location));
+    let performance = Arc::new(Performance::default());
+    let ts_server = TsServer::new(performance, cache.clone());
     let ts_config = TsConfig::new(config);
-    assert_eq!(
-      request(
-        &mut runtime,
-        state_snapshot.clone(),
-        RequestMethod::Configure(ts_config),
-        Default::default(),
-      )
-      .expect("failed request"),
-      json!(true)
-    );
-    (runtime, state_snapshot, location)
+    assert!(ts_server
+      .configure(snapshot.clone(), ts_config,)
+      .await
+      .unwrap());
+    (ts_server, snapshot, cache)
   }
 
   #[test]
@@ -3361,57 +4520,48 @@ mod tests {
     assert_eq!(actual, r"test [`a link`](http://deno.land/x/mod.ts) test");
   }
 
-  #[test]
-  fn test_project_configure() {
+  #[tokio::test]
+  async fn test_project_configure() {
     let temp_dir = TempDir::new();
     setup(
       &temp_dir,
-      false,
       json!({
         "target": "esnext",
         "module": "esnext",
         "noEmit": true,
       }),
       &[],
-    );
+    )
+    .await;
   }
 
-  #[test]
-  fn test_project_reconfigure() {
+  #[tokio::test]
+  async fn test_project_reconfigure() {
     let temp_dir = TempDir::new();
-    let (mut runtime, state_snapshot, _) = setup(
+    let (ts_server, snapshot, _) = setup(
       &temp_dir,
-      false,
       json!({
         "target": "esnext",
         "module": "esnext",
         "noEmit": true,
       }),
       &[],
-    );
+    )
+    .await;
     let ts_config = TsConfig::new(json!({
       "target": "esnext",
       "module": "esnext",
       "noEmit": true,
       "lib": ["deno.ns", "deno.worker"]
     }));
-    let result = request(
-      &mut runtime,
-      state_snapshot,
-      RequestMethod::Configure(ts_config),
-      Default::default(),
-    );
-    assert!(result.is_ok());
-    let response = result.unwrap();
-    assert_eq!(response, json!(true));
+    assert!(ts_server.configure(snapshot, ts_config).await.unwrap());
   }
 
-  #[test]
-  fn test_get_diagnostics() {
+  #[tokio::test]
+  async fn test_get_diagnostics() {
     let temp_dir = TempDir::new();
-    let (mut runtime, state_snapshot, _) = setup(
+    let (ts_server, snapshot, _) = setup(
       &temp_dir,
-      false,
       json!({
         "target": "esnext",
         "module": "esnext",
@@ -3423,18 +4573,15 @@ mod tests {
         1,
         LanguageId::TypeScript,
       )],
-    );
+    )
+    .await;
     let specifier = resolve_url("file:///a.ts").expect("could not resolve url");
-    let result = request(
-      &mut runtime,
-      state_snapshot,
-      RequestMethod::GetDiagnostics(vec![specifier]),
-      Default::default(),
-    );
-    assert!(result.is_ok());
-    let response = result.unwrap();
+    let diagnostics = ts_server
+      .get_diagnostics(snapshot, vec![specifier], Default::default())
+      .await
+      .unwrap();
     assert_eq!(
-      response,
+      json!(diagnostics),
       json!({
         "file:///a.ts": [
           {
@@ -3457,12 +4604,11 @@ mod tests {
     );
   }
 
-  #[test]
-  fn test_get_diagnostics_lib() {
+  #[tokio::test]
+  async fn test_get_diagnostics_lib() {
     let temp_dir = TempDir::new();
-    let (mut runtime, state_snapshot, _) = setup(
+    let (ts_server, snapshot, _) = setup(
       &temp_dir,
-      false,
       json!({
         "target": "esnext",
         "module": "esnext",
@@ -3476,25 +4622,21 @@ mod tests {
         1,
         LanguageId::TypeScript,
       )],
-    );
+    )
+    .await;
     let specifier = resolve_url("file:///a.ts").expect("could not resolve url");
-    let result = request(
-      &mut runtime,
-      state_snapshot,
-      RequestMethod::GetDiagnostics(vec![specifier]),
-      Default::default(),
-    );
-    assert!(result.is_ok());
-    let response = result.unwrap();
-    assert_eq!(response, json!({ "file:///a.ts": [] }));
+    let diagnostics = ts_server
+      .get_diagnostics(snapshot, vec![specifier], Default::default())
+      .await
+      .unwrap();
+    assert_eq!(json!(diagnostics), json!({ "file:///a.ts": [] }));
   }
 
-  #[test]
-  fn test_module_resolution() {
+  #[tokio::test]
+  async fn test_module_resolution() {
     let temp_dir = TempDir::new();
-    let (mut runtime, state_snapshot, _) = setup(
+    let (ts_server, snapshot, _) = setup(
       &temp_dir,
-      false,
       json!({
         "target": "esnext",
         "module": "esnext",
@@ -3513,25 +4655,21 @@ mod tests {
         1,
         LanguageId::TypeScript,
       )],
-    );
+    )
+    .await;
     let specifier = resolve_url("file:///a.ts").expect("could not resolve url");
-    let result = request(
-      &mut runtime,
-      state_snapshot,
-      RequestMethod::GetDiagnostics(vec![specifier]),
-      Default::default(),
-    );
-    assert!(result.is_ok());
-    let response = result.unwrap();
-    assert_eq!(response, json!({ "file:///a.ts": [] }));
+    let diagnostics = ts_server
+      .get_diagnostics(snapshot, vec![specifier], Default::default())
+      .await
+      .unwrap();
+    assert_eq!(json!(diagnostics), json!({ "file:///a.ts": [] }));
   }
 
-  #[test]
-  fn test_bad_module_specifiers() {
+  #[tokio::test]
+  async fn test_bad_module_specifiers() {
     let temp_dir = TempDir::new();
-    let (mut runtime, state_snapshot, _) = setup(
+    let (ts_server, snapshot, _) = setup(
       &temp_dir,
-      false,
       json!({
         "target": "esnext",
         "module": "esnext",
@@ -3546,18 +4684,15 @@ mod tests {
         1,
         LanguageId::TypeScript,
       )],
-    );
+    )
+    .await;
     let specifier = resolve_url("file:///a.ts").expect("could not resolve url");
-    let result = request(
-      &mut runtime,
-      state_snapshot,
-      RequestMethod::GetDiagnostics(vec![specifier]),
-      Default::default(),
-    );
-    assert!(result.is_ok());
-    let response = result.unwrap();
+    let diagnostics = ts_server
+      .get_diagnostics(snapshot, vec![specifier], Default::default())
+      .await
+      .unwrap();
     assert_eq!(
-      response,
+      json!(diagnostics),
       json!({
         "file:///a.ts": [{
           "start": {
@@ -3573,18 +4708,16 @@ mod tests {
           "sourceLine": "        import { A } from \".\";",
           "category": 2,
           "code": 6133,
-          "reportsUnnecessary": true,
         }]
       })
     );
   }
 
-  #[test]
-  fn test_remote_modules() {
+  #[tokio::test]
+  async fn test_remote_modules() {
     let temp_dir = TempDir::new();
-    let (mut runtime, state_snapshot, _) = setup(
+    let (ts_server, snapshot, _) = setup(
       &temp_dir,
-      false,
       json!({
         "target": "esnext",
         "module": "esnext",
@@ -3603,25 +4736,21 @@ mod tests {
         1,
         LanguageId::TypeScript,
       )],
-    );
+    )
+    .await;
     let specifier = resolve_url("file:///a.ts").expect("could not resolve url");
-    let result = request(
-      &mut runtime,
-      state_snapshot,
-      RequestMethod::GetDiagnostics(vec![specifier]),
-      Default::default(),
-    );
-    assert!(result.is_ok());
-    let response = result.unwrap();
-    assert_eq!(response, json!({ "file:///a.ts": [] }));
+    let diagnostics = ts_server
+      .get_diagnostics(snapshot, vec![specifier], Default::default())
+      .await
+      .unwrap();
+    assert_eq!(json!(diagnostics), json!({ "file:///a.ts": [] }));
   }
 
-  #[test]
-  fn test_partial_modules() {
+  #[tokio::test]
+  async fn test_partial_modules() {
     let temp_dir = TempDir::new();
-    let (mut runtime, state_snapshot, _) = setup(
+    let (ts_server, snapshot, _) = setup(
       &temp_dir,
-      false,
       json!({
         "target": "esnext",
         "module": "esnext",
@@ -3643,18 +4772,15 @@ mod tests {
         1,
         LanguageId::TypeScript,
       )],
-    );
+    )
+    .await;
     let specifier = resolve_url("file:///a.ts").expect("could not resolve url");
-    let result = request(
-      &mut runtime,
-      state_snapshot,
-      RequestMethod::GetDiagnostics(vec![specifier]),
-      Default::default(),
-    );
-    assert!(result.is_ok());
-    let response = result.unwrap();
+    let diagnostics = ts_server
+      .get_diagnostics(snapshot, vec![specifier], Default::default())
+      .await
+      .unwrap();
     assert_eq!(
-      response,
+      json!(diagnostics),
       json!({
         "file:///a.ts": [{
           "start": {
@@ -3670,7 +4796,6 @@ mod tests {
           "sourceLine": "        import {",
           "category": 2,
           "code": 6192,
-          "reportsUnnecessary": true
         }, {
           "start": {
             "line": 8,
@@ -3690,12 +4815,11 @@ mod tests {
     );
   }
 
-  #[test]
-  fn test_no_debug_failure() {
+  #[tokio::test]
+  async fn test_no_debug_failure() {
     let temp_dir = TempDir::new();
-    let (mut runtime, state_snapshot, _) = setup(
+    let (ts_server, snapshot, _) = setup(
       &temp_dir,
-      false,
       json!({
         "target": "esnext",
         "module": "esnext",
@@ -3708,18 +4832,15 @@ mod tests {
         1,
         LanguageId::TypeScript,
       )],
-    );
+    )
+    .await;
     let specifier = resolve_url("file:///a.ts").expect("could not resolve url");
-    let result = request(
-      &mut runtime,
-      state_snapshot,
-      RequestMethod::GetDiagnostics(vec![specifier]),
-      Default::default(),
-    );
-    assert!(result.is_ok());
-    let response = result.unwrap();
+    let diagnostics = ts_server
+      .get_diagnostics(snapshot, vec![specifier], Default::default())
+      .await
+      .unwrap();
     assert_eq!(
-      response,
+      json!(diagnostics),
       json!({
         "file:///a.ts": [
           {
@@ -3742,40 +4863,43 @@ mod tests {
     );
   }
 
-  #[test]
-  fn test_request_asset() {
+  #[tokio::test]
+  async fn test_request_assets() {
     let temp_dir = TempDir::new();
-    let (mut runtime, state_snapshot, _) = setup(
-      &temp_dir,
-      false,
-      json!({
-        "target": "esnext",
-        "module": "esnext",
-        "lib": ["deno.ns", "deno.window"],
-        "noEmit": true,
-      }),
-      &[],
-    );
-    let specifier =
-      resolve_url("asset:///lib.esnext.d.ts").expect("could not resolve url");
-    let result = request(
-      &mut runtime,
-      state_snapshot,
-      RequestMethod::GetAsset(specifier),
-      Default::default(),
-    );
-    assert!(result.is_ok());
-    let response: Option<String> =
-      serde_json::from_value(result.unwrap()).unwrap();
-    assert!(response.is_some());
+    let (ts_server, snapshot, _) = setup(&temp_dir, json!({}), &[]).await;
+    let assets = get_isolate_assets(&ts_server, snapshot).await;
+    let mut asset_names = assets
+      .iter()
+      .map(|a| {
+        a.specifier()
+          .to_string()
+          .replace("asset:///lib.", "")
+          .replace(".d.ts", "")
+      })
+      .collect::<Vec<_>>();
+    let mut expected_asset_names: Vec<String> = serde_json::from_str(
+      include_str!(concat!(env!("OUT_DIR"), "/lib_file_names.json")),
+    )
+    .unwrap();
+    asset_names.sort();
+
+    expected_asset_names.sort();
+    assert_eq!(asset_names, expected_asset_names);
+
+    // get some notification when the size of the assets grows
+    let mut total_size = 0;
+    for asset in assets {
+      total_size += asset.text().len();
+    }
+    assert!(total_size > 0);
+    assert!(total_size < 2_000_000); // currently as of TS 4.6, it's 0.7MB
   }
 
-  #[test]
-  fn test_modify_sources() {
+  #[tokio::test]
+  async fn test_modify_sources() {
     let temp_dir = TempDir::new();
-    let (mut runtime, state_snapshot, location) = setup(
+    let (ts_server, snapshot, cache) = setup(
       &temp_dir,
-      false,
       json!({
         "target": "esnext",
         "module": "esnext",
@@ -3793,8 +4917,8 @@ mod tests {
         1,
         LanguageId::TypeScript,
       )],
-    );
-    let cache = HttpCache::new(&location);
+    )
+    .await;
     let specifier_dep =
       resolve_url("https://deno.land/x/example/a.ts").unwrap();
     cache
@@ -3805,16 +4929,12 @@ mod tests {
       )
       .unwrap();
     let specifier = resolve_url("file:///a.ts").unwrap();
-    let result = request(
-      &mut runtime,
-      state_snapshot.clone(),
-      RequestMethod::GetDiagnostics(vec![specifier]),
-      Default::default(),
-    );
-    assert!(result.is_ok());
-    let response = result.unwrap();
+    let diagnostics = ts_server
+      .get_diagnostics(snapshot.clone(), vec![specifier], Default::default())
+      .await
+      .unwrap();
     assert_eq!(
-      response,
+      json!(diagnostics),
       json!({
         "file:///a.ts": [
           {
@@ -3843,50 +4963,16 @@ mod tests {
       )
       .unwrap();
     let specifier = resolve_url("file:///a.ts").unwrap();
-    let result = request(
-      &mut runtime,
-      state_snapshot,
-      RequestMethod::GetDiagnostics(vec![specifier]),
-      Default::default(),
-    );
-    assert!(result.is_ok());
-    let response = result.unwrap();
+    let diagnostics = ts_server
+      .get_diagnostics(snapshot.clone(), vec![specifier], Default::default())
+      .await
+      .unwrap();
     assert_eq!(
-      response,
+      json!(diagnostics),
       json!({
         "file:///a.ts": []
       })
     );
-  }
-
-  #[test]
-  fn test_op_exists() {
-    let temp_dir = TempDir::new();
-    let (mut rt, state_snapshot, _) = setup(
-      &temp_dir,
-      false,
-      json!({
-        "target": "esnext",
-        "module": "esnext",
-        "lib": ["deno.ns", "deno.window"],
-        "noEmit": true,
-      }),
-      &[],
-    );
-    let performance = Arc::new(Performance::default());
-    let state = State::new(state_snapshot, performance);
-    let op_state = rt.op_state();
-    let mut op_state = op_state.borrow_mut();
-    op_state.put(state);
-    let actual = op_exists::call(
-      &mut op_state,
-      SpecifierArgs {
-        specifier: "/error/unknown:something/index.d.ts".to_string(),
-      },
-    );
-    assert!(actual.is_ok());
-    let actual = actual.unwrap();
-    assert!(!actual);
   }
 
   #[test]
@@ -3906,7 +4992,7 @@ mod tests {
       ..Default::default()
     };
     let actual = fixture.get_filter_text();
-    assert_eq!(actual, Some("abc".to_string()));
+    assert_eq!(actual, None);
 
     let fixture = CompletionEntry {
       kind: ScriptElementKind::MemberVariableElement,
@@ -3918,8 +5004,8 @@ mod tests {
     assert_eq!(actual, Some("abc".to_string()));
   }
 
-  #[test]
-  fn test_completions() {
+  #[tokio::test]
+  async fn test_completions() {
     let fixture = r#"
       import { B } from "https://deno.land/x/b/mod.ts";
 
@@ -3935,9 +5021,8 @@ mod tests {
       })
       .unwrap();
     let temp_dir = TempDir::new();
-    let (mut runtime, state_snapshot, _) = setup(
+    let (ts_server, snapshot, _) = setup(
       &temp_dir,
-      false,
       json!({
         "target": "esnext",
         "module": "esnext",
@@ -3945,19 +5030,12 @@ mod tests {
         "noEmit": true,
       }),
       &[("file:///a.ts", fixture, 1, LanguageId::TypeScript)],
-    );
+    )
+    .await;
     let specifier = resolve_url("file:///a.ts").expect("could not resolve url");
-    let result = request(
-      &mut runtime,
-      state_snapshot.clone(),
-      RequestMethod::GetDiagnostics(vec![specifier.clone()]),
-      Default::default(),
-    );
-    assert!(result.is_ok());
-    let result = request(
-      &mut runtime,
-      state_snapshot.clone(),
-      RequestMethod::GetCompletions((
+    let info = ts_server
+      .get_completions(
+        snapshot.clone(),
         specifier.clone(),
         position,
         GetCompletionsAtPositionOptions {
@@ -3966,30 +5044,31 @@ mod tests {
             ..Default::default()
           },
           trigger_character: Some(".".to_string()),
+          trigger_kind: None,
         },
-      )),
-      Default::default(),
-    );
-    assert!(result.is_ok());
-    let response: CompletionInfo =
-      serde_json::from_value(result.unwrap()).unwrap();
-    assert_eq!(response.entries.len(), 19);
-    let result = request(
-      &mut runtime,
-      state_snapshot,
-      RequestMethod::GetCompletionDetails(GetCompletionDetailsArgs {
-        specifier,
-        position,
-        name: "log".to_string(),
-        source: None,
-        data: None,
-      }),
-      Default::default(),
-    );
-    assert!(result.is_ok());
-    let response = result.unwrap();
+        Default::default(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(info.entries.len(), 22);
+    let details = ts_server
+      .get_completion_details(
+        snapshot.clone(),
+        GetCompletionDetailsArgs {
+          specifier,
+          position,
+          name: "log".to_string(),
+          format_code_settings: None,
+          source: None,
+          preferences: None,
+          data: None,
+        },
+      )
+      .await
+      .unwrap()
+      .unwrap();
     assert_eq!(
-      response,
+      json!(details),
       json!({
         "name": "log",
         "kindModifiers": "declare",
@@ -4074,6 +5153,178 @@ mod tests {
         ],
         "documentation": []
       })
+    );
+  }
+
+  #[tokio::test]
+  async fn test_completions_fmt() {
+    let fixture_a = r#"
+      console.log(someLongVaria)
+    "#;
+    let fixture_b = r#"
+      export const someLongVariable = 1
+    "#;
+    let line_index = LineIndex::new(fixture_a);
+    let position = line_index
+      .offset_tsc(lsp::Position {
+        line: 1,
+        character: 33,
+      })
+      .unwrap();
+    let temp_dir = TempDir::new();
+    let (ts_server, snapshot, _) = setup(
+      &temp_dir,
+      json!({
+        "target": "esnext",
+        "module": "esnext",
+        "lib": ["deno.ns", "deno.window"],
+        "noEmit": true,
+      }),
+      &[
+        ("file:///a.ts", fixture_a, 1, LanguageId::TypeScript),
+        ("file:///b.ts", fixture_b, 1, LanguageId::TypeScript),
+      ],
+    )
+    .await;
+    let specifier = resolve_url("file:///a.ts").expect("could not resolve url");
+    let fmt_options_config = FmtOptionsConfig {
+      semi_colons: Some(false),
+      single_quote: Some(true),
+      ..Default::default()
+    };
+    let info = ts_server
+      .get_completions(
+        snapshot.clone(),
+        specifier.clone(),
+        position,
+        GetCompletionsAtPositionOptions {
+          user_preferences: UserPreferences {
+            quote_preference: Some((&fmt_options_config).into()),
+            include_completions_for_module_exports: Some(true),
+            include_completions_with_insert_text: Some(true),
+            ..Default::default()
+          },
+          ..Default::default()
+        },
+        FormatCodeSettings::from(&fmt_options_config),
+      )
+      .await
+      .unwrap();
+    let entry = info
+      .entries
+      .iter()
+      .find(|e| &e.name == "someLongVariable")
+      .unwrap();
+    let details = ts_server
+      .get_completion_details(
+        snapshot.clone(),
+        GetCompletionDetailsArgs {
+          specifier,
+          position,
+          name: entry.name.clone(),
+          format_code_settings: Some(FormatCodeSettings::from(
+            &fmt_options_config,
+          )),
+          source: entry.source.clone(),
+          preferences: Some(UserPreferences {
+            quote_preference: Some((&fmt_options_config).into()),
+            ..Default::default()
+          }),
+          data: entry.data.clone(),
+        },
+      )
+      .await
+      .unwrap()
+      .unwrap();
+    let actions = details.code_actions.unwrap();
+    let action = actions
+      .iter()
+      .find(|a| &a.description == r#"Add import from "./b.ts""#)
+      .unwrap();
+    let changes = action.changes.first().unwrap();
+    let change = changes.text_changes.first().unwrap();
+    assert_eq!(
+      change.new_text,
+      "import { someLongVariable } from './b.ts'\n"
+    );
+  }
+
+  #[tokio::test]
+  async fn test_get_edits_for_file_rename() {
+    let temp_dir = TempDir::new();
+    let (ts_server, snapshot, _) = setup(
+      &temp_dir,
+      json!({
+        "target": "esnext",
+        "module": "esnext",
+        "lib": ["deno.ns", "deno.window"],
+        "noEmit": true,
+      }),
+      &[
+        (
+          "file:///a.ts",
+          r#"import "./b.ts";"#,
+          1,
+          LanguageId::TypeScript,
+        ),
+        ("file:///b.ts", r#""#, 1, LanguageId::TypeScript),
+      ],
+    )
+    .await;
+    let changes = ts_server
+      .get_edits_for_file_rename(
+        snapshot,
+        resolve_url("file:///b.ts").unwrap(),
+        resolve_url("file:///c.ts").unwrap(),
+        FormatCodeSettings::default(),
+        UserPreferences::default(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(
+      changes,
+      vec![FileTextChanges {
+        file_name: "file:///a.ts".to_string(),
+        text_changes: vec![TextChange {
+          span: TextSpan {
+            start: 8,
+            length: 6,
+          },
+          new_text: "./c.ts".to_string(),
+        }],
+        is_new_file: None,
+      }]
+    );
+  }
+
+  #[test]
+  fn include_suppress_inlay_hint_settings() {
+    let mut settings = WorkspaceSettings::default();
+    settings
+      .typescript
+      .inlay_hints
+      .parameter_names
+      .suppress_when_argument_matches_name = true;
+    settings
+      .typescript
+      .inlay_hints
+      .variable_types
+      .suppress_when_type_matches_name = true;
+    let mut config = config::Config::new();
+    config.set_workspace_settings(settings, None);
+    let user_preferences = UserPreferences::from_config_for_specifier(
+      &config,
+      &Default::default(),
+      &ModuleSpecifier::parse("file:///foo.ts").unwrap(),
+    );
+    assert_eq!(
+      user_preferences.include_inlay_variable_type_hints_when_type_matches_name,
+      Some(false)
+    );
+    assert_eq!(
+      user_preferences
+        .include_inlay_parameter_name_hints_when_argument_matches_name,
+      Some(false)
     );
   }
 }

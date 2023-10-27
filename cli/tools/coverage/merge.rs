@@ -1,6 +1,7 @@
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+//
 // Forked from https://github.com/demurgos/v8-coverage/tree/d0ca18da8740198681e0bc68971b0a6cdb11db3e/rust
 // Copyright 2021 Charles Samborski. All rights reserved. MIT license.
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
 
 use super::json_types::CoverageRange;
 use super::json_types::FunctionCoverage;
@@ -25,7 +26,7 @@ pub fn merge_processes(
     for script_cov in process_cov.result {
       url_to_scripts
         .entry(script_cov.url.clone())
-        .or_insert_with(Vec::new)
+        .or_default()
         .push(script_cov);
     }
   }
@@ -54,27 +55,24 @@ pub fn merge_scripts(
     let first: &ScriptCoverage = &scripts[0];
     (first.script_id.clone(), first.url.clone())
   };
-  let mut range_to_funcs: BTreeMap<Range, Vec<FunctionCoverage>> =
+  let mut range_to_funcs: BTreeMap<CharRange, Vec<FunctionCoverage>> =
     BTreeMap::new();
   for script_cov in scripts {
     for func_cov in script_cov.functions {
       let root_range = {
         let root_range_cov: &CoverageRange = &func_cov.ranges[0];
-        Range {
-          start: root_range_cov.start_offset,
-          end: root_range_cov.end_offset,
+        CharRange {
+          start: root_range_cov.start_char_offset,
+          end: root_range_cov.end_char_offset,
         }
       };
-      range_to_funcs
-        .entry(root_range)
-        .or_insert_with(Vec::new)
-        .push(func_cov);
+      range_to_funcs.entry(root_range).or_default().push(func_cov);
     }
   }
 
   let functions: Vec<FunctionCoverage> = range_to_funcs
-    .into_iter()
-    .map(|(_, funcs)| merge_functions(funcs).unwrap())
+    .into_values()
+    .map(|funcs| merge_functions(funcs).unwrap())
     .collect();
 
   Some(ScriptCoverage {
@@ -85,12 +83,12 @@ pub fn merge_scripts(
 }
 
 #[derive(Eq, PartialEq, Hash, Copy, Clone, Debug)]
-struct Range {
+struct CharRange {
   start: usize,
   end: usize,
 }
 
-impl Ord for Range {
+impl Ord for CharRange {
   fn cmp(&self, other: &Self) -> ::std::cmp::Ordering {
     if self.start != other.start {
       self.start.cmp(&other.start)
@@ -100,13 +98,9 @@ impl Ord for Range {
   }
 }
 
-impl PartialOrd for Range {
+impl PartialOrd for CharRange {
   fn partial_cmp(&self, other: &Self) -> Option<::std::cmp::Ordering> {
-    if self.start != other.start {
-      self.start.partial_cmp(&other.start)
-    } else {
-      other.end.partial_cmp(&self.end)
-    }
+    Some(self.cmp(other))
   }
 }
 
@@ -126,8 +120,7 @@ pub fn merge_functions(
       trees.push(tree);
     }
   }
-  let merged =
-    RangeTree::normalize(&rta, merge_range_trees(&rta, trees).unwrap());
+  let merged = RangeTree::normalize(merge_range_trees(&rta, trees).unwrap());
   let ranges = merged.to_ranges();
   let is_block_coverage: bool = !(ranges.len() == 1 && ranges[0].count == 0);
 
@@ -167,7 +160,7 @@ fn into_start_events<'a>(trees: Vec<&'a mut RangeTree<'a>>) -> Vec<StartEvent> {
     for child in tree.children.drain(..) {
       result
         .entry(child.start)
-        .or_insert_with(Vec::new)
+        .or_default()
         .push((parent_index, child));
     }
   }
@@ -229,7 +222,7 @@ impl<'a> Iterator for StartEventQueue<'a> {
               let mut result = self.queue.next().unwrap();
               if pending_offset == queue_offset {
                 let pending_trees = self.pending.take().unwrap().trees;
-                result.trees.extend(pending_trees.into_iter())
+                result.trees.extend(pending_trees)
               }
               Some(result)
             }
@@ -249,7 +242,7 @@ fn merge_range_tree_children<'a>(
     Vec::with_capacity(parent_trees.len());
   let mut wrapped_children: Vec<Vec<&'a mut RangeTree<'a>>> =
     Vec::with_capacity(parent_trees.len());
-  let mut open_range: Option<Range> = None;
+  let mut open_range: Option<CharRange> = None;
 
   for _parent_tree in parent_trees.iter() {
     flat_children.push(Vec::new());
@@ -294,7 +287,7 @@ fn merge_range_tree_children<'a>(
           };
           parent_to_nested
             .entry(parent_index)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(child);
         }
       }
@@ -312,13 +305,10 @@ fn merge_range_tree_children<'a>(
             flat_children[parent_index].push(tree);
             continue;
           }
-          parent_to_nested
-            .entry(parent_index)
-            .or_insert_with(Vec::new)
-            .push(tree);
+          parent_to_nested.entry(parent_index).or_default().push(tree);
         }
         start_event_queue.set_pending_offset(open_range_end);
-        open_range = Some(Range {
+        open_range = Some(CharRange {
           start: event.offset,
           end: open_range_end,
         });
@@ -338,7 +328,7 @@ fn merge_range_tree_children<'a>(
 
   let child_forests: Vec<Vec<&'a mut RangeTree<'a>>> = flat_children
     .into_iter()
-    .zip(wrapped_children.into_iter())
+    .zip(wrapped_children)
     .map(|(flat, wrapped)| merge_children_lists(flat, wrapped))
     .collect();
 
@@ -356,7 +346,11 @@ fn merge_range_tree_children<'a>(
     let mut matching_trees: Vec<&'a mut RangeTree<'a>> = Vec::new();
     for (_parent_index, children) in child_forests.iter_mut().enumerate() {
       let next_tree: Option<&'a mut RangeTree<'a>> = {
-        if children.peek().map_or(false, |tree| tree.start == *event) {
+        if children
+          .peek()
+          .map(|tree| tree.start == *event)
+          .unwrap_or(false)
+        {
           children.next()
         } else {
           None
@@ -452,8 +446,8 @@ mod tests {
             function_name: String::from("lib"),
             is_block_coverage: true,
             ranges: vec![CoverageRange {
-              start_offset: 0,
-              end_offset: 9,
+              start_char_offset: 0,
+              end_char_offset: 9,
               count: 1,
             }],
           }],
@@ -467,8 +461,8 @@ mod tests {
             function_name: String::from("lib"),
             is_block_coverage: true,
             ranges: vec![CoverageRange {
-              start_offset: 0,
-              end_offset: 9,
+              start_char_offset: 0,
+              end_char_offset: 9,
               count: 2,
             }],
           }],
@@ -483,8 +477,8 @@ mod tests {
           function_name: String::from("lib"),
           is_block_coverage: true,
           ranges: vec![CoverageRange {
-            start_offset: 0,
-            end_offset: 9,
+            start_char_offset: 0,
+            end_char_offset: 9,
             count: 3,
           }],
         }],
@@ -506,13 +500,13 @@ mod tests {
             is_block_coverage: true,
             ranges: vec![
               CoverageRange {
-                start_offset: 0,
-                end_offset: 9,
+                start_char_offset: 0,
+                end_char_offset: 9,
                 count: 10,
               },
               CoverageRange {
-                start_offset: 3,
-                end_offset: 6,
+                start_char_offset: 3,
+                end_char_offset: 6,
                 count: 1,
               },
             ],
@@ -528,13 +522,13 @@ mod tests {
             is_block_coverage: true,
             ranges: vec![
               CoverageRange {
-                start_offset: 0,
-                end_offset: 9,
+                start_char_offset: 0,
+                end_char_offset: 9,
                 count: 20,
               },
               CoverageRange {
-                start_offset: 3,
-                end_offset: 6,
+                start_char_offset: 3,
+                end_char_offset: 6,
                 count: 2,
               },
             ],
@@ -551,13 +545,13 @@ mod tests {
           is_block_coverage: true,
           ranges: vec![
             CoverageRange {
-              start_offset: 0,
-              end_offset: 9,
+              start_char_offset: 0,
+              end_char_offset: 9,
               count: 30,
             },
             CoverageRange {
-              start_offset: 3,
-              end_offset: 6,
+              start_char_offset: 3,
+              end_char_offset: 6,
               count: 3,
             },
           ],
@@ -580,13 +574,13 @@ mod tests {
             is_block_coverage: true,
             ranges: vec![
               CoverageRange {
-                start_offset: 0,
-                end_offset: 9,
+                start_char_offset: 0,
+                end_char_offset: 9,
                 count: 10,
               },
               CoverageRange {
-                start_offset: 2,
-                end_offset: 5,
+                start_char_offset: 2,
+                end_char_offset: 5,
                 count: 1,
               },
             ],
@@ -602,13 +596,13 @@ mod tests {
             is_block_coverage: true,
             ranges: vec![
               CoverageRange {
-                start_offset: 0,
-                end_offset: 9,
+                start_char_offset: 0,
+                end_char_offset: 9,
                 count: 20,
               },
               CoverageRange {
-                start_offset: 4,
-                end_offset: 7,
+                start_char_offset: 4,
+                end_char_offset: 7,
                 count: 2,
               },
             ],
@@ -625,23 +619,23 @@ mod tests {
           is_block_coverage: true,
           ranges: vec![
             CoverageRange {
-              start_offset: 0,
-              end_offset: 9,
+              start_char_offset: 0,
+              end_char_offset: 9,
               count: 30,
             },
             CoverageRange {
-              start_offset: 2,
-              end_offset: 5,
+              start_char_offset: 2,
+              end_char_offset: 5,
               count: 21,
             },
             CoverageRange {
-              start_offset: 4,
-              end_offset: 5,
+              start_char_offset: 4,
+              end_char_offset: 5,
               count: 3,
             },
             CoverageRange {
-              start_offset: 5,
-              end_offset: 7,
+              start_char_offset: 5,
+              end_char_offset: 7,
               count: 12,
             },
           ],
@@ -664,23 +658,23 @@ mod tests {
             is_block_coverage: true,
             ranges: vec![
               CoverageRange {
-                start_offset: 0,
-                end_offset: 9,
+                start_char_offset: 0,
+                end_char_offset: 9,
                 count: 1,
               },
               CoverageRange {
-                start_offset: 1,
-                end_offset: 8,
+                start_char_offset: 1,
+                end_char_offset: 8,
                 count: 6,
               },
               CoverageRange {
-                start_offset: 1,
-                end_offset: 5,
+                start_char_offset: 1,
+                end_char_offset: 5,
                 count: 5,
               },
               CoverageRange {
-                start_offset: 5,
-                end_offset: 8,
+                start_char_offset: 5,
+                end_char_offset: 8,
                 count: 7,
               },
             ],
@@ -696,23 +690,23 @@ mod tests {
             is_block_coverage: true,
             ranges: vec![
               CoverageRange {
-                start_offset: 0,
-                end_offset: 9,
+                start_char_offset: 0,
+                end_char_offset: 9,
                 count: 4,
               },
               CoverageRange {
-                start_offset: 1,
-                end_offset: 8,
+                start_char_offset: 1,
+                end_char_offset: 8,
                 count: 8,
               },
               CoverageRange {
-                start_offset: 1,
-                end_offset: 5,
+                start_char_offset: 1,
+                end_char_offset: 5,
                 count: 9,
               },
               CoverageRange {
-                start_offset: 5,
-                end_offset: 8,
+                start_char_offset: 5,
+                end_char_offset: 8,
                 count: 7,
               },
             ],
@@ -729,13 +723,13 @@ mod tests {
           is_block_coverage: true,
           ranges: vec![
             CoverageRange {
-              start_offset: 0,
-              end_offset: 9,
+              start_char_offset: 0,
+              end_char_offset: 9,
               count: 5,
             },
             CoverageRange {
-              start_offset: 1,
-              end_offset: 8,
+              start_char_offset: 1,
+              end_char_offset: 8,
               count: 14,
             },
           ],
@@ -758,13 +752,13 @@ mod tests {
             is_block_coverage: true,
             ranges: vec![
               CoverageRange {
-                start_offset: 0,
-                end_offset: 7,
+                start_char_offset: 0,
+                end_char_offset: 7,
                 count: 10,
               },
               CoverageRange {
-                start_offset: 0,
-                end_offset: 4,
+                start_char_offset: 0,
+                end_char_offset: 4,
                 count: 1,
               },
             ],
@@ -780,18 +774,18 @@ mod tests {
             is_block_coverage: true,
             ranges: vec![
               CoverageRange {
-                start_offset: 0,
-                end_offset: 7,
+                start_char_offset: 0,
+                end_char_offset: 7,
                 count: 20,
               },
               CoverageRange {
-                start_offset: 1,
-                end_offset: 6,
+                start_char_offset: 1,
+                end_char_offset: 6,
                 count: 11,
               },
               CoverageRange {
-                start_offset: 2,
-                end_offset: 5,
+                start_char_offset: 2,
+                end_char_offset: 5,
                 count: 2,
               },
             ],
@@ -808,23 +802,23 @@ mod tests {
           is_block_coverage: true,
           ranges: vec![
             CoverageRange {
-              start_offset: 0,
-              end_offset: 7,
+              start_char_offset: 0,
+              end_char_offset: 7,
               count: 30,
             },
             CoverageRange {
-              start_offset: 0,
-              end_offset: 6,
+              start_char_offset: 0,
+              end_char_offset: 6,
               count: 21,
             },
             CoverageRange {
-              start_offset: 1,
-              end_offset: 5,
+              start_char_offset: 1,
+              end_char_offset: 5,
               count: 12,
             },
             CoverageRange {
-              start_offset: 2,
-              end_offset: 4,
+              start_char_offset: 2,
+              end_char_offset: 4,
               count: 3,
             },
           ],

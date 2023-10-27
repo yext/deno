@@ -1,4 +1,4 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 import {
   assert,
   assertEquals,
@@ -82,6 +82,27 @@ Deno.test(async function timeoutEvalNoScopeLeak() {
   const error = await global.globalPromise;
   assertEquals(error.name, "ReferenceError");
   Reflect.deleteProperty(global, "globalPromise");
+});
+
+Deno.test(async function evalPrimordial() {
+  const global = globalThis as unknown as {
+    globalPromise: ReturnType<typeof deferred>;
+  };
+  global.globalPromise = deferred();
+  const originalEval = globalThis.eval;
+  let wasCalled = false;
+  globalThis.eval = (argument) => {
+    wasCalled = true;
+    return originalEval(argument);
+  };
+  setTimeout(
+    "globalThis.globalPromise.resolve();" as unknown as () => void,
+    0,
+  );
+  await global.globalPromise;
+  assert(!wasCalled);
+  Reflect.deleteProperty(global, "globalPromise");
+  globalThis.eval = originalEval;
 });
 
 Deno.test(async function timeoutArgs() {
@@ -215,7 +236,7 @@ Deno.test(async function callbackTakesLongerThanInterval() {
   const interval = setInterval(() => {
     if (timeEndOfFirstCallback === undefined) {
       // First callback
-      Deno.sleepSync(300);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
       timeEndOfFirstCallback = Date.now();
     } else {
       // Second callback
@@ -237,7 +258,7 @@ Deno.test(async function clearTimeoutAfterNextTimerIsDue1() {
   }, 300);
 
   const interval = setInterval(() => {
-    Deno.sleepSync(400);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
     // Both the interval and the timeout's due times are now in the past.
     clearInterval(interval);
   }, 100);
@@ -255,7 +276,7 @@ Deno.test(async function clearTimeoutAfterNextTimerIsDue2() {
     promise.resolve();
   }, 200);
 
-  Deno.sleepSync(300);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
   // Both of the timeouts' due times are now in the past.
   clearTimeout(timeout1);
 
@@ -531,58 +552,12 @@ Deno.test(async function timerIgnoresDateOverride() {
   assertEquals(hasThrown, 1);
 });
 
-Deno.test({ permissions: { hrtime: true } }, function sleepSync() {
-  const start = performance.now();
-  Deno.sleepSync(10);
-  const after = performance.now();
-  assert(after - start >= 10);
-});
-
-Deno.test(
-  { permissions: { hrtime: true } },
-  async function sleepSyncShorterPromise() {
-    const perf = performance;
-    const short = 5;
-    const long = 10;
-
-    const start = perf.now();
-    const p = delay(short).then(() => {
-      const after = perf.now();
-      // pending promises should resolve after the main thread comes out of sleep
-      assert(after - start >= long);
-    });
-    Deno.sleepSync(long);
-
-    await p;
-  },
-);
-
-Deno.test(
-  { permissions: { hrtime: true } },
-  async function sleepSyncLongerPromise() {
-    const perf = performance;
-    const short = 5;
-    const long = 10;
-
-    const start = perf.now();
-    const p = delay(long).then(() => {
-      const after = perf.now();
-      // sleeping for less than the duration of a promise should have no impact
-      // on the resolution of that promise
-      assert(after - start >= long);
-    });
-    Deno.sleepSync(short);
-
-    await p;
-  },
-);
-
 Deno.test({
   name: "unrefTimer",
   permissions: { run: true, read: true },
   fn: async () => {
     const [statusCode, output] = await execCode(`
-      const timer = setTimeout(() => console.log("1"));
+      const timer = setTimeout(() => console.log("1"), 1);
       Deno.unrefTimer(timer);
     `);
     assertEquals(statusCode, 0);
@@ -750,5 +725,51 @@ Deno.test({
     `);
     assertEquals(statusCode, 0);
     assertEquals(output, "");
+  },
+});
+
+// Regression test for https://github.com/denoland/deno/issues/19866
+Deno.test({
+  name: "regression for #19866",
+  fn: async () => {
+    const timeoutsFired = [];
+
+    // deno-lint-ignore require-await
+    async function start(n: number) {
+      let i = 0;
+      const intervalId = setInterval(() => {
+        i++;
+        if (i > 2) {
+          clearInterval(intervalId!);
+        }
+        timeoutsFired.push(n);
+      }, 20);
+    }
+
+    for (let n = 0; n < 100; n++) {
+      start(n);
+    }
+
+    // 3s should be plenty of time for all the intervals to fire
+    // but it might still be flaky on CI.
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    assertEquals(timeoutsFired.length, 300);
+  },
+});
+
+// Regression test for https://github.com/denoland/deno/issues/20367
+Deno.test({
+  name: "regression for #20367",
+  fn: async () => {
+    const promise = deferred<number>();
+    const start = performance.now();
+    setTimeout(() => {
+      const end = performance.now();
+      promise.resolve(end - start);
+    }, 1000);
+    clearTimeout(setTimeout(() => {}, 1000));
+
+    const result = await promise;
+    assert(result >= 1000);
   },
 });

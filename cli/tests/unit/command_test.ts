@@ -1,4 +1,5 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+
 import {
   assert,
   assertEquals,
@@ -9,7 +10,7 @@ import {
 
 Deno.test(
   { permissions: { write: true, run: true, read: true } },
-  async function spawnWithCwdIsAsync() {
+  async function commandWithCwdIsAsync() {
     const enc = new TextEncoder();
     const cwd = await Deno.makeTempDir({ prefix: "deno_command_test" });
 
@@ -31,12 +32,13 @@ tryExit();
 
     Deno.writeFileSync(`${cwd}/${programFile}`, enc.encode(program));
 
-    const child = Deno.spawnChild(Deno.execPath(), {
+    const command = new Deno.Command(Deno.execPath(), {
       cwd,
       args: ["run", "--allow-read", programFile],
       stdout: "inherit",
       stderr: "inherit",
     });
+    const child = command.spawn();
 
     // Write the expected exit code *after* starting deno.
     // This is how we verify that `Child` is actually asynchronous.
@@ -53,8 +55,8 @@ tryExit();
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  async function spawnStdinPiped() {
-    const child = Deno.spawnChild(Deno.execPath(), {
+  async function commandStdinPiped() {
+    const command = new Deno.Command(Deno.execPath(), {
       args: [
         "eval",
         "if (new TextDecoder().decode(await Deno.readAll(Deno.stdin)) !== 'hello') throw new Error('Expected \\'hello\\'')",
@@ -63,10 +65,10 @@ Deno.test(
       stdout: "null",
       stderr: "null",
     });
+    const child = command.spawn();
 
-    assert(child.stdin !== null);
-    assert(child.stdout === null);
-    assert(child.stderr === null);
+    assertThrows(() => child.stdout, TypeError, "stdout is not piped");
+    assertThrows(() => child.stderr, TypeError, "stderr is not piped");
 
     const msg = new TextEncoder().encode("hello");
     const writer = child.stdin.getWriter();
@@ -83,18 +85,37 @@ Deno.test(
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  async function spawnStdoutPiped() {
-    const child = Deno.spawnChild(Deno.execPath(), {
+  async function commandStdinPiped() {
+    const command = new Deno.Command(Deno.execPath(), {
+      args: ["info"],
+      stdout: "null",
+      stderr: "null",
+    });
+    const child = command.spawn();
+
+    assertThrows(() => child.stdin, TypeError, "stdin is not piped");
+    assertThrows(() => child.stdout, TypeError, "stdout is not piped");
+    assertThrows(() => child.stderr, TypeError, "stderr is not piped");
+
+    await child.status;
+  },
+);
+
+Deno.test(
+  { permissions: { run: true, read: true } },
+  async function commandStdoutPiped() {
+    const command = new Deno.Command(Deno.execPath(), {
       args: [
         "eval",
         "await Deno.stdout.write(new TextEncoder().encode('hello'))",
       ],
       stderr: "null",
+      stdout: "piped",
     });
+    const child = command.spawn();
 
-    assert(child.stdin === null);
-    assert(child.stdout !== null);
-    assert(child.stderr === null);
+    assertThrows(() => child.stdin, TypeError, "stdin is not piped");
+    assertThrows(() => child.stderr, TypeError, "stderr is not piped");
 
     const readable = child.stdout.pipeThrough(new TextDecoderStream());
     const reader = readable.getReader();
@@ -116,19 +137,19 @@ Deno.test(
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  async function spawnStderrPiped() {
-    const child = Deno.spawnChild(Deno.execPath(), {
+  async function commandStderrPiped() {
+    const command = new Deno.Command(Deno.execPath(), {
       args: [
         "eval",
         "await Deno.stderr.write(new TextEncoder().encode('hello'))",
       ],
-      stderr: "piped",
       stdout: "null",
+      stderr: "piped",
     });
+    const child = command.spawn();
 
-    assert(child.stdin === null);
-    assert(child.stdout === null);
-    assert(child.stderr !== null);
+    assertThrows(() => child.stdin, TypeError, "stdin is not piped");
+    assertThrows(() => child.stdout, TypeError, "stdout is not piped");
 
     const readable = child.stderr.pipeThrough(new TextDecoderStream());
     const reader = readable.getReader();
@@ -150,7 +171,7 @@ Deno.test(
 
 Deno.test(
   { permissions: { run: true, write: true, read: true } },
-  async function spawnRedirectStdoutStderr() {
+  async function commandRedirectStdoutStderr() {
     const tempDir = await Deno.makeTempDir();
     const fileName = tempDir + "/redirected_stdio.txt";
     const file = await Deno.open(fileName, {
@@ -158,12 +179,15 @@ Deno.test(
       write: true,
     });
 
-    const child = Deno.spawnChild(Deno.execPath(), {
+    const command = new Deno.Command(Deno.execPath(), {
       args: [
         "eval",
         "Deno.stderr.write(new TextEncoder().encode('error\\n')); Deno.stdout.write(new TextEncoder().encode('output\\n'));",
       ],
+      stdout: "piped",
+      stderr: "piped",
     });
+    const child = command.spawn();
     await child.stdout.pipeTo(file.writable, {
       preventClose: true,
     });
@@ -181,14 +205,14 @@ Deno.test(
 
 Deno.test(
   { permissions: { run: true, write: true, read: true } },
-  async function spawnRedirectStdin() {
+  async function commandRedirectStdin() {
     const tempDir = await Deno.makeTempDir();
     const fileName = tempDir + "/redirected_stdio.txt";
     const encoder = new TextEncoder();
     await Deno.writeFile(fileName, encoder.encode("hello"));
     const file = await Deno.open(fileName);
 
-    const child = Deno.spawnChild(Deno.execPath(), {
+    const command = new Deno.Command(Deno.execPath(), {
       args: [
         "eval",
         "if (new TextDecoder().decode(await Deno.readAll(Deno.stdin)) !== 'hello') throw new Error('Expected \\'hello\\'')",
@@ -197,6 +221,7 @@ Deno.test(
       stdout: "null",
       stderr: "null",
     });
+    const child = command.spawn();
     await file.readable.pipeTo(child.stdin, {
       preventClose: true,
     });
@@ -209,12 +234,13 @@ Deno.test(
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  async function spawnKillSuccess() {
-    const child = Deno.spawnChild(Deno.execPath(), {
+  async function commandKillSuccess() {
+    const command = new Deno.Command(Deno.execPath(), {
       args: ["eval", "setTimeout(() => {}, 10000)"],
       stdout: "null",
       stderr: "null",
     });
+    const child = command.spawn();
 
     child.kill("SIGKILL");
     const status = await child.status;
@@ -225,19 +251,20 @@ Deno.test(
       assertEquals(status.signal, null);
     } else {
       assertEquals(status.code, 137);
-      assertEquals(status.signal, 9);
+      assertEquals(status.signal, "SIGKILL");
     }
   },
 );
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  async function spawnKillFailed() {
-    const child = Deno.spawnChild(Deno.execPath(), {
+  async function commandKillFailed() {
+    const command = new Deno.Command(Deno.execPath(), {
       args: ["eval", "setTimeout(() => {}, 5000)"],
       stdout: "null",
       stderr: "null",
     });
+    const child = command.spawn();
 
     assertThrows(() => {
       // @ts-expect-error testing runtime error of bad signal
@@ -249,124 +276,200 @@ Deno.test(
 );
 
 Deno.test(
+  { permissions: { run: true, read: true } },
+  async function commandKillOptional() {
+    const command = new Deno.Command(Deno.execPath(), {
+      args: ["eval", "setTimeout(() => {}, 10000)"],
+      stdout: "null",
+      stderr: "null",
+    });
+    const child = command.spawn();
+
+    child.kill();
+    const status = await child.status;
+
+    assertEquals(status.success, false);
+    if (Deno.build.os === "windows") {
+      assertEquals(status.code, 1);
+      assertEquals(status.signal, null);
+    } else {
+      assertEquals(status.code, 143);
+      assertEquals(status.signal, "SIGTERM");
+    }
+  },
+);
+
+Deno.test(
+  { permissions: { run: true, read: true } },
+  async function commandAbort() {
+    const ac = new AbortController();
+    const command = new Deno.Command(Deno.execPath(), {
+      args: [
+        "eval",
+        "setTimeout(console.log, 1e8)",
+      ],
+      signal: ac.signal,
+      stdout: "null",
+      stderr: "null",
+    });
+    const child = command.spawn();
+    queueMicrotask(() => ac.abort());
+    const status = await child.status;
+    assertEquals(status.success, false);
+    if (Deno.build.os === "windows") {
+      assertEquals(status.code, 1);
+      assertEquals(status.signal, null);
+    } else {
+      assertEquals(status.success, false);
+      assertEquals(status.code, 143);
+    }
+  },
+);
+
+Deno.test(
   { permissions: { read: true, run: false } },
-  async function spawnPermissions() {
+  async function commandPermissions() {
     await assertRejects(async () => {
-      await Deno.spawn(Deno.execPath(), {
+      await new Deno.Command(Deno.execPath(), {
         args: ["eval", "console.log('hello world')"],
-      });
+      }).output();
     }, Deno.errors.PermissionDenied);
   },
 );
 
 Deno.test(
   { permissions: { read: true, run: false } },
-  function spawnSyncPermissions() {
+  function commandSyncPermissions() {
     assertThrows(() => {
-      Deno.spawnSync(Deno.execPath(), {
+      new Deno.Command(Deno.execPath(), {
         args: ["eval", "console.log('hello world')"],
-      });
+      }).outputSync();
     }, Deno.errors.PermissionDenied);
   },
 );
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  async function spawnSuccess() {
-    const { status } = await Deno.spawn(Deno.execPath(), {
+  async function commandSuccess() {
+    const output = await new Deno.Command(Deno.execPath(), {
       args: ["eval", "console.log('hello world')"],
-    });
+    }).output();
 
-    assertEquals(status.success, true);
-    assertEquals(status.code, 0);
-    assertEquals(status.signal, null);
+    assertEquals(output.success, true);
+    assertEquals(output.code, 0);
+    assertEquals(output.signal, null);
   },
 );
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  function spawnSyncSuccess() {
-    const { status } = Deno.spawnSync(Deno.execPath(), {
+  function commandSyncSuccess() {
+    const output = new Deno.Command(Deno.execPath(), {
       args: ["eval", "console.log('hello world')"],
-    });
+    }).outputSync();
 
-    assertEquals(status.success, true);
-    assertEquals(status.code, 0);
-    assertEquals(status.signal, null);
+    assertEquals(output.success, true);
+    assertEquals(output.code, 0);
+    assertEquals(output.signal, null);
   },
 );
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  async function spawnUrl() {
-    const { status, stdout } = await Deno.spawn(
+  async function commandUrl() {
+    const output = await new Deno.Command(
       new URL(`file:///${Deno.execPath()}`),
       {
         args: ["eval", "console.log('hello world')"],
       },
-    );
+    ).output();
 
-    assertEquals(new TextDecoder().decode(stdout), "hello world\n");
+    assertEquals(new TextDecoder().decode(output.stdout), "hello world\n");
 
-    assertEquals(status.success, true);
-    assertEquals(status.code, 0);
-    assertEquals(status.signal, null);
+    assertEquals(output.success, true);
+    assertEquals(output.code, 0);
+    assertEquals(output.signal, null);
   },
 );
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  function spawnSyncUrl() {
-    const { status, stdout } = Deno.spawnSync(
+  function commandSyncUrl() {
+    const output = new Deno.Command(
       new URL(`file:///${Deno.execPath()}`),
       {
         args: ["eval", "console.log('hello world')"],
       },
-    );
+    ).outputSync();
 
-    assertEquals(new TextDecoder().decode(stdout), "hello world\n");
+    assertEquals(new TextDecoder().decode(output.stdout), "hello world\n");
 
-    assertEquals(status.success, true);
-    assertEquals(status.code, 0);
-    assertEquals(status.signal, null);
+    assertEquals(output.success, true);
+    assertEquals(output.code, 0);
+    assertEquals(output.signal, null);
   },
 );
 
-Deno.test({ permissions: { run: true } }, async function spawnNotFound() {
-  await assertRejects(
-    () => Deno.spawn("this file hopefully doesn't exist"),
-    Deno.errors.NotFound,
-  );
-});
-
-Deno.test({ permissions: { run: true } }, function spawnSyncNotFound() {
+Deno.test({ permissions: { run: true } }, function commandNotFound() {
   assertThrows(
-    () => Deno.spawnSync("this file hopefully doesn't exist"),
+    () => new Deno.Command("this file hopefully doesn't exist").output(),
     Deno.errors.NotFound,
+  );
+});
+
+Deno.test({ permissions: { run: true } }, function commandSyncNotFound() {
+  assertThrows(
+    () => new Deno.Command("this file hopefully doesn't exist").outputSync(),
+    Deno.errors.NotFound,
+  );
+});
+
+Deno.test({ permissions: { run: true, read: true } }, function cwdNotFound() {
+  assertThrows(
+    () =>
+      new Deno.Command(Deno.execPath(), {
+        cwd: Deno.cwd() + "/non-existent-directory",
+      }).output(),
+    Deno.errors.NotFound,
+    "No such cwd",
   );
 });
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  async function spawnFailedWithCode() {
-    const { status } = await Deno.spawn(Deno.execPath(), {
-      args: ["eval", "Deno.exit(41 + 1)"],
-    });
-    assertEquals(status.success, false);
-    assertEquals(status.code, 42);
-    assertEquals(status.signal, null);
+  function cwdNotDirectory() {
+    assertThrows(
+      () =>
+        new Deno.Command(Deno.execPath(), {
+          cwd: Deno.execPath(),
+        }).output(),
+      Deno.errors.NotFound,
+      "cwd is not a directory",
+    );
   },
 );
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  function spawnSyncFailedWithCode() {
-    const { status } = Deno.spawnSync(Deno.execPath(), {
+  async function commandFailedWithCode() {
+    const output = await new Deno.Command(Deno.execPath(), {
       args: ["eval", "Deno.exit(41 + 1)"],
-    });
-    assertEquals(status.success, false);
-    assertEquals(status.code, 42);
-    assertEquals(status.signal, null);
+    }).output();
+    assertEquals(output.success, false);
+    assertEquals(output.code, 42);
+    assertEquals(output.signal, null);
+  },
+);
+
+Deno.test(
+  { permissions: { run: true, read: true } },
+  function commandSyncFailedWithCode() {
+    const output = new Deno.Command(Deno.execPath(), {
+      args: ["eval", "Deno.exit(41 + 1)"],
+    }).outputSync();
+    assertEquals(output.success, false);
+    assertEquals(output.code, 42);
+    assertEquals(output.signal, null);
   },
 );
 
@@ -374,17 +477,17 @@ Deno.test(
   {
     permissions: { run: true, read: true },
   },
-  async function spawnFailedWithSignal() {
-    const { status } = await Deno.spawn(Deno.execPath(), {
+  async function commandFailedWithSignal() {
+    const output = await new Deno.Command(Deno.execPath(), {
       args: ["eval", "--unstable", "Deno.kill(Deno.pid, 'SIGKILL')"],
-    });
-    assertEquals(status.success, false);
+    }).output();
+    assertEquals(output.success, false);
     if (Deno.build.os === "windows") {
-      assertEquals(status.code, 1);
-      assertEquals(status.signal, null);
+      assertEquals(output.code, 1);
+      assertEquals(output.signal, null);
     } else {
-      assertEquals(status.code, 128 + 9);
-      assertEquals(status.signal, 9);
+      assertEquals(output.code, 128 + 9);
+      assertEquals(output.signal, "SIGKILL");
     }
   },
 );
@@ -393,30 +496,30 @@ Deno.test(
   {
     permissions: { run: true, read: true },
   },
-  function spawnSyncFailedWithSignal() {
-    const { status } = Deno.spawnSync(Deno.execPath(), {
+  function commandSyncFailedWithSignal() {
+    const output = new Deno.Command(Deno.execPath(), {
       args: ["eval", "--unstable", "Deno.kill(Deno.pid, 'SIGKILL')"],
-    });
-    assertEquals(status.success, false);
+    }).outputSync();
+    assertEquals(output.success, false);
     if (Deno.build.os === "windows") {
-      assertEquals(status.code, 1);
-      assertEquals(status.signal, null);
+      assertEquals(output.code, 1);
+      assertEquals(output.signal, null);
     } else {
-      assertEquals(status.code, 128 + 9);
-      assertEquals(status.signal, 9);
+      assertEquals(output.code, 128 + 9);
+      assertEquals(output.signal, "SIGKILL");
     }
   },
 );
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  async function spawnOutput() {
-    const { stdout } = await Deno.spawn(Deno.execPath(), {
+  async function commandOutput() {
+    const { stdout } = await new Deno.Command(Deno.execPath(), {
       args: [
         "eval",
         "await Deno.stdout.write(new TextEncoder().encode('hello'))",
       ],
-    });
+    }).output();
 
     const s = new TextDecoder().decode(stdout);
     assertEquals(s, "hello");
@@ -425,13 +528,13 @@ Deno.test(
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  function spawnSyncOutput() {
-    const { stdout } = Deno.spawnSync(Deno.execPath(), {
+  function commandSyncOutput() {
+    const { stdout } = new Deno.Command(Deno.execPath(), {
       args: [
         "eval",
         "await Deno.stdout.write(new TextEncoder().encode('hello'))",
       ],
-    });
+    }).outputSync();
 
     const s = new TextDecoder().decode(stdout);
     assertEquals(s, "hello");
@@ -440,13 +543,13 @@ Deno.test(
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  async function spawnStderrOutput() {
-    const { stderr } = await Deno.spawn(Deno.execPath(), {
+  async function commandStderrOutput() {
+    const { stderr } = await new Deno.Command(Deno.execPath(), {
       args: [
         "eval",
         "await Deno.stderr.write(new TextEncoder().encode('error'))",
       ],
-    });
+    }).output();
 
     const s = new TextDecoder().decode(stderr);
     assertEquals(s, "error");
@@ -455,13 +558,13 @@ Deno.test(
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  function spawnSyncStderrOutput() {
-    const { stderr } = Deno.spawnSync(Deno.execPath(), {
+  function commandSyncStderrOutput() {
+    const { stderr } = new Deno.Command(Deno.execPath(), {
       args: [
         "eval",
         "await Deno.stderr.write(new TextEncoder().encode('error'))",
       ],
-    });
+    }).outputSync();
 
     const s = new TextDecoder().decode(stderr);
     assertEquals(s, "error");
@@ -470,48 +573,8 @@ Deno.test(
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  async function spawnOverrideStdio() {
-    const { stdout, stderr } = await Deno.spawn(Deno.execPath(), {
-      args: [
-        "eval",
-        "console.log('hello'); console.error('world')",
-      ],
-      stdin: "piped",
-      stdout: "null",
-      stderr: "null",
-    });
-
-    // @ts-ignore: for testing
-    assertEquals(new TextDecoder().decode(stdout), "hello\n");
-    // @ts-ignore: for testing
-    assertEquals(new TextDecoder().decode(stderr), "world\n");
-  },
-);
-
-Deno.test(
-  { permissions: { run: true, read: true } },
-  function spawnSyncOverrideStdio() {
-    const { stdout, stderr } = Deno.spawnSync(Deno.execPath(), {
-      args: [
-        "eval",
-        "console.log('hello'); console.error('world')",
-      ],
-      stdin: "piped",
-      stdout: "null",
-      stderr: "null",
-    });
-
-    // @ts-ignore: for testing
-    assertEquals(new TextDecoder().decode(stdout), "hello\n");
-    // @ts-ignore: for testing
-    assertEquals(new TextDecoder().decode(stderr), "world\n");
-  },
-);
-
-Deno.test(
-  { permissions: { run: true, read: true } },
-  async function spawnEnv() {
-    const { stdout } = await Deno.spawn(Deno.execPath(), {
+  async function commandEnv() {
+    const { stdout } = await new Deno.Command(Deno.execPath(), {
       args: [
         "eval",
         "Deno.stdout.write(new TextEncoder().encode(Deno.env.get('FOO') + Deno.env.get('BAR')))",
@@ -520,7 +583,7 @@ Deno.test(
         FOO: "0123",
         BAR: "4567",
       },
-    });
+    }).output();
     const s = new TextDecoder().decode(stdout);
     assertEquals(s, "01234567");
   },
@@ -528,8 +591,8 @@ Deno.test(
 
 Deno.test(
   { permissions: { run: true, read: true } },
-  function spawnEnv() {
-    const { stdout } = Deno.spawnSync(Deno.execPath(), {
+  function commandSyncEnv() {
+    const { stdout } = new Deno.Command(Deno.execPath(), {
       args: [
         "eval",
         "Deno.stdout.write(new TextEncoder().encode(Deno.env.get('FOO') + Deno.env.get('BAR')))",
@@ -538,7 +601,7 @@ Deno.test(
         FOO: "0123",
         BAR: "4567",
       },
-    });
+    }).outputSync();
     const s = new TextDecoder().decode(stdout);
     assertEquals(s, "01234567");
   },
@@ -546,8 +609,8 @@ Deno.test(
 
 Deno.test(
   { permissions: { run: true, read: true, env: true } },
-  async function spawnClearEnv() {
-    const { stdout } = await Deno.spawn(Deno.execPath(), {
+  async function commandClearEnv() {
+    const { stdout } = await new Deno.Command(Deno.execPath(), {
       args: [
         "eval",
         "-p",
@@ -557,7 +620,7 @@ Deno.test(
       env: {
         FOO: "23147",
       },
-    });
+    }).output();
 
     const obj = JSON.parse(new TextDecoder().decode(stdout));
 
@@ -571,8 +634,8 @@ Deno.test(
 
 Deno.test(
   { permissions: { run: true, read: true, env: true } },
-  function spawnSyncClearEnv() {
-    const { stdout } = Deno.spawnSync(Deno.execPath(), {
+  function commandSyncClearEnv() {
+    const { stdout } = new Deno.Command(Deno.execPath(), {
       args: [
         "eval",
         "-p",
@@ -582,7 +645,7 @@ Deno.test(
       env: {
         FOO: "23147",
       },
-    });
+    }).outputSync();
 
     const obj = JSON.parse(new TextDecoder().decode(stdout));
 
@@ -599,19 +662,19 @@ Deno.test(
     permissions: { run: true, read: true },
     ignore: Deno.build.os === "windows",
   },
-  async function spawnUid() {
-    const { stdout } = await Deno.spawn("id", {
+  async function commandUid() {
+    const { stdout } = await new Deno.Command("id", {
       args: ["-u"],
-    });
+    }).output();
 
     const currentUid = new TextDecoder().decode(stdout);
 
     if (currentUid !== "0") {
       await assertRejects(async () => {
-        await Deno.spawn("echo", {
+        await new Deno.Command("echo", {
           args: ["fhqwhgads"],
           uid: 0,
-        });
+        }).output();
       }, Deno.errors.PermissionDenied);
     }
   },
@@ -622,19 +685,19 @@ Deno.test(
     permissions: { run: true, read: true },
     ignore: Deno.build.os === "windows",
   },
-  function spawnSyncUid() {
-    const { stdout } = Deno.spawnSync("id", {
+  function commandSyncUid() {
+    const { stdout } = new Deno.Command("id", {
       args: ["-u"],
-    });
+    }).outputSync();
 
     const currentUid = new TextDecoder().decode(stdout);
 
     if (currentUid !== "0") {
       assertThrows(() => {
-        Deno.spawnSync("echo", {
+        new Deno.Command("echo", {
           args: ["fhqwhgads"],
           uid: 0,
-        });
+        }).outputSync();
       }, Deno.errors.PermissionDenied);
     }
   },
@@ -645,19 +708,19 @@ Deno.test(
     permissions: { run: true, read: true },
     ignore: Deno.build.os === "windows",
   },
-  async function spawnGid() {
-    const { stdout } = await Deno.spawn("id", {
+  async function commandGid() {
+    const { stdout } = await new Deno.Command("id", {
       args: ["-g"],
-    });
+    }).output();
 
     const currentGid = new TextDecoder().decode(stdout);
 
     if (currentGid !== "0") {
       await assertRejects(async () => {
-        await Deno.spawn("echo", {
+        await new Deno.Command("echo", {
           args: ["fhqwhgads"],
           gid: 0,
-        });
+        }).output();
       }, Deno.errors.PermissionDenied);
     }
   },
@@ -668,20 +731,198 @@ Deno.test(
     permissions: { run: true, read: true },
     ignore: Deno.build.os === "windows",
   },
-  function spawnSyncGid() {
-    const { stdout } = Deno.spawnSync("id", {
+  function commandSyncGid() {
+    const { stdout } = new Deno.Command("id", {
       args: ["-g"],
-    });
+    }).outputSync();
 
     const currentGid = new TextDecoder().decode(stdout);
 
     if (currentGid !== "0") {
       assertThrows(() => {
-        Deno.spawnSync("echo", {
+        new Deno.Command("echo", {
           args: ["fhqwhgads"],
           gid: 0,
-        });
+        }).outputSync();
       }, Deno.errors.PermissionDenied);
     }
+  },
+);
+
+Deno.test(function commandStdinPipedFails() {
+  assertThrows(
+    () =>
+      new Deno.Command("id", {
+        stdin: "piped",
+      }).output(),
+    TypeError,
+    "Piped stdin is not supported for this function, use 'Deno.Command.spawn()' instead",
+  );
+});
+
+Deno.test(function spawnSyncStdinPipedFails() {
+  assertThrows(
+    () =>
+      new Deno.Command("id", {
+        stdin: "piped",
+      }).outputSync(),
+    TypeError,
+    "Piped stdin is not supported for this function, use 'Deno.Command.spawn()' instead",
+  );
+});
+
+Deno.test(
+  // FIXME(bartlomieju): this test is very flaky on CI, fix it
+  {
+    ignore: true,
+    permissions: { write: true, run: true, read: true },
+  },
+  async function commandChildUnref() {
+    const enc = new TextEncoder();
+    const cwd = await Deno.makeTempDir({ prefix: "deno_command_test" });
+
+    const programFile = "unref.ts";
+    const program = `
+const command = await new Deno.Command(Deno.execPath(), {
+  cwd: Deno.args[0],
+  stdout: "piped",
+  args: ["run", "-A", "--unstable", Deno.args[1]],
+});
+const child = command.spawn();
+const readable = child.stdout.pipeThrough(new TextDecoderStream());
+const reader = readable.getReader();
+// set up an interval that will end after reading a few messages from stdout,
+// to verify that stdio streams are properly unrefed
+let count = 0;
+let interval;
+interval = setInterval(async () => {
+  count += 1;
+  if (count > 10) {
+    clearInterval(interval);
+    console.log("cleared interval");
+  }
+  const res = await reader.read();
+  if (res.done) {
+    throw new Error("stream shouldn't be done");
+  }
+  if (res.value.trim() != "hello from interval") {
+    throw new Error("invalid message received");
+  }
+}, 120);
+console.log("spawned pid", child.pid);
+child.unref();
+`;
+
+    const childProgramFile = "unref_child.ts";
+    const childProgram = `
+setInterval(() => {
+  console.log("hello from interval");
+}, 100);
+`;
+    Deno.writeFileSync(`${cwd}/${programFile}`, enc.encode(program));
+    Deno.writeFileSync(`${cwd}/${childProgramFile}`, enc.encode(childProgram));
+    // In this subprocess we are spawning another subprocess which has
+    // an infinite interval set. Following call would never resolve unless
+    // child process gets unrefed.
+    const { success, stdout, stderr } = await new Deno.Command(
+      Deno.execPath(),
+      {
+        cwd,
+        args: ["run", "-A", "--unstable", programFile, cwd, childProgramFile],
+      },
+    ).output();
+
+    assert(success);
+    const stdoutText = new TextDecoder().decode(stdout);
+    const stderrText = new TextDecoder().decode(stderr);
+    assert(stderrText.length == 0);
+    const [line1, line2] = stdoutText.split("\n");
+    const pidStr = line1.split(" ").at(-1);
+    assert(pidStr);
+    assertEquals(line2, "cleared interval");
+    const pid = Number.parseInt(pidStr, 10);
+    await Deno.remove(cwd, { recursive: true });
+    // Child process should have been killed when parent process exits.
+    assertThrows(() => {
+      Deno.kill(pid, "SIGTERM");
+    }, Deno.errors.NotFound);
+  },
+);
+
+Deno.test(
+  { ignore: Deno.build.os !== "windows" },
+  async function commandWindowsRawArguments() {
+    let { success, stdout } = await new Deno.Command("cmd", {
+      args: ["/d", "/s", "/c", '"deno ^"--version^""'],
+      windowsRawArguments: true,
+    }).output();
+    assert(success);
+    let stdoutText = new TextDecoder().decode(stdout);
+    assertStringIncludes(stdoutText, "deno");
+    assertStringIncludes(stdoutText, "v8");
+    assertStringIncludes(stdoutText, "typescript");
+
+    ({ success, stdout } = new Deno.Command("cmd", {
+      args: ["/d", "/s", "/c", '"deno ^"--version^""'],
+      windowsRawArguments: true,
+    }).outputSync());
+    assert(success);
+    stdoutText = new TextDecoder().decode(stdout);
+    assertStringIncludes(stdoutText, "deno");
+    assertStringIncludes(stdoutText, "v8");
+    assertStringIncludes(stdoutText, "typescript");
+  },
+);
+
+Deno.test(
+  { permissions: { read: true, run: true } },
+  async function commandWithPrototypePollution() {
+    const originalThen = Promise.prototype.then;
+    const originalSymbolIterator = Array.prototype[Symbol.iterator];
+    try {
+      Promise.prototype.then = Array.prototype[Symbol.iterator] = () => {
+        throw new Error();
+      };
+      await new Deno.Command(Deno.execPath(), {
+        args: ["eval", "console.log('hello world')"],
+      }).output();
+    } finally {
+      Promise.prototype.then = originalThen;
+      Array.prototype[Symbol.iterator] = originalSymbolIterator;
+    }
+  },
+);
+
+Deno.test(
+  { permissions: { run: true, read: true } },
+  async function commandKillAfterStatus() {
+    const command = new Deno.Command(Deno.execPath(), {
+      args: ["help"],
+      stdout: "null",
+      stderr: "null",
+    });
+    const child = command.spawn();
+    await child.status;
+    assertThrows(
+      () => child.kill(),
+      TypeError,
+      "Child process has already terminated.",
+    );
+  },
+);
+
+Deno.test(
+  "process that fails to spawn, prints its name in error",
+  async () => {
+    assertThrows(
+      () => new Deno.Command("doesntexist").outputSync(),
+      Error,
+      "Failed to spawn 'doesntexist'",
+    );
+    await assertRejects(
+      async () => await new Deno.Command("doesntexist").output(),
+      Error,
+      "Failed to spawn 'doesntexist'",
+    );
   },
 );

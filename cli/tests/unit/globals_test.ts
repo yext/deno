@@ -1,6 +1,6 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 // deno-lint-ignore-file no-window-prefix
-import { assert } from "./test_util.ts";
+import { assert, assertEquals } from "./test_util.ts";
 
 Deno.test(function globalThisExists() {
   assert(globalThis != null);
@@ -71,12 +71,8 @@ Deno.test(function webAssemblyExists() {
   assert(typeof WebAssembly.compile === "function");
 });
 
-declare global {
-  namespace Deno {
-    // deno-lint-ignore no-explicit-any, no-var
-    var core: any;
-  }
-}
+// @ts-ignore This is not publicly typed namespace, but it's there for sure.
+const core = Deno[Deno.internal].core;
 
 Deno.test(function DenoNamespaceConfigurable() {
   const desc = Object.getOwnPropertyDescriptor(globalThis, "Deno");
@@ -86,19 +82,19 @@ Deno.test(function DenoNamespaceConfigurable() {
 });
 
 Deno.test(function DenoCoreNamespaceIsImmutable() {
-  const { print } = Deno.core;
+  const { print } = core;
   try {
-    Deno.core.print = 1;
+    core.print = 1;
   } catch {
     // pass
   }
-  assert(print === Deno.core.print);
+  assert(print === core.print);
   try {
-    delete Deno.core.print;
+    delete core.print;
   } catch {
     // pass
   }
-  assert(print === Deno.core.print);
+  assert(print === core.print);
 });
 
 Deno.test(async function windowQueueMicrotask() {
@@ -131,4 +127,16 @@ Deno.test(function webApiGlobalThis() {
   assert(globalThis.TextDecoderStream !== null);
   assert(globalThis.CountQueuingStrategy !== null);
   assert(globalThis.ByteLengthQueuingStrategy !== null);
+});
+
+Deno.test(function windowNameIsDefined() {
+  assertEquals(typeof globalThis.name, "string");
+  assertEquals(name, "");
+  assertEquals(window.name, name);
+  name = "foobar";
+  assertEquals(window.name, "foobar");
+  assertEquals(name, "foobar");
+  name = "";
+  assertEquals(window.name, "");
+  assertEquals(name, "");
 });

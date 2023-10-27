@@ -1,4 +1,4 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 import {
   assert,
   assertEquals,
@@ -9,9 +9,9 @@ import {
   Deferred,
   deferred,
 } from "./test_util.ts";
-import { BufReader, BufWriter } from "../../../test_util/std/io/bufio.ts";
-import { readAll } from "../../../test_util/std/io/util.ts";
-import { TextProtoReader } from "../../../test_util/std/textproto/mod.ts";
+import { BufReader, BufWriter } from "../../../test_util/std/io/mod.ts";
+import { readAll } from "../../../test_util/std/streams/read_all.ts";
+import { TextProtoReader } from "../testdata/run/textproto.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -36,18 +36,9 @@ Deno.test({ permissions: { net: false } }, async function connectTLSNoPerm() {
 Deno.test(
   { permissions: { read: true, net: true } },
   async function connectTLSInvalidHost() {
-    const listener = await Deno.listenTls({
-      hostname: "localhost",
-      port: 3567,
-      certFile: "cli/tests/testdata/tls/localhost.crt",
-      keyFile: "cli/tests/testdata/tls/localhost.key",
-    });
-
     await assertRejects(async () => {
-      await Deno.connectTls({ hostname: "127.0.0.1", port: 3567 });
+      await Deno.connectTls({ hostname: "256.0.0.0", port: 3567 });
     }, TypeError);
-
-    listener.close();
   },
 );
 
@@ -157,6 +148,33 @@ Deno.test(
 );
 
 Deno.test(
+  { permissions: { net: true } },
+  async function startTlsWithoutExclusiveAccessToTcpConn() {
+    const hostname = "localhost";
+    const port = getPort();
+
+    const tcpListener = Deno.listen({ hostname, port });
+    const [serverConn, clientConn] = await Promise.all([
+      tcpListener.accept(),
+      Deno.connect({ hostname, port }),
+    ]);
+
+    const buf = new Uint8Array(128);
+    const readPromise = clientConn.read(buf);
+    // `clientConn` is being used by a pending promise (`readPromise`) so
+    // `Deno.startTls` cannot consume the connection.
+    await assertRejects(
+      () => Deno.startTls(clientConn, { hostname }),
+      Deno.errors.BadResource,
+    );
+
+    serverConn.close();
+    tcpListener.close();
+    await readPromise;
+  },
+);
+
+Deno.test(
   { permissions: { read: true, net: true } },
   async function dialAndListenTLS() {
     const resolvable = deferred();
@@ -204,7 +222,7 @@ Deno.test(
     assertEquals(proto, "HTTP/1.1");
     assertEquals(status, "200");
     assertEquals(ok, "OK");
-    const headers = await tpr.readMIMEHeader();
+    const headers = await tpr.readMimeHeader();
     assert(headers !== null);
     const contentLength = parseInt(headers.get("content-length")!);
     const bodyBuf = new Uint8Array(contentLength);
@@ -257,7 +275,7 @@ Deno.test(
     assertEquals(proto, "HTTP/1.1");
     assertEquals(status, "200");
     assertEquals(ok, "OK");
-    const headers = await tpr.readMIMEHeader();
+    const headers = await tpr.readMimeHeader();
     assert(headers !== null);
     const contentLength = parseInt(headers.get("content-length")!);
     const bodyBuf = new Uint8Array(contentLength);
@@ -1028,20 +1046,14 @@ function createHttpsListener(port: number): Deno.Listener {
 }
 
 async function curl(url: string): Promise<string> {
-  const curl = Deno.run({
-    cmd: ["curl", "--insecure", url],
-    stdout: "piped",
-  });
+  const { success, code, stdout } = await new Deno.Command("curl", {
+    args: ["--insecure", url],
+  }).output();
 
-  try {
-    const [status, output] = await Promise.all([curl.status(), curl.output()]);
-    if (!status.success) {
-      throw new Error(`curl ${url} failed: ${status.code}`);
-    }
-    return new TextDecoder().decode(output);
-  } finally {
-    curl.close();
+  if (!success) {
+    throw new Error(`curl ${url} failed: ${code}`);
   }
+  return new TextDecoder().decode(stdout);
 }
 
 Deno.test(
@@ -1069,7 +1081,8 @@ Deno.test(
 );
 
 Deno.test(
-  { permissions: { read: true, net: true } },
+  // Ignored because gmail appears to reject us on CI sometimes
+  { ignore: true, permissions: { read: true, net: true } },
   async function startTls() {
     const hostname = "smtp.gmail.com";
     const port = 587;
@@ -1325,7 +1338,7 @@ Deno.test(
           await assertRejects(
             () => conn.handshake(),
             Deno.errors.InvalidData,
-            "BadCertificate",
+            "received fatal alert",
           );
         }
         conn.close();
@@ -1356,11 +1369,153 @@ Deno.test(
       await assertRejects(
         () => tlsConn.handshake(),
         Deno.errors.InvalidData,
-        "CertNotValidForName",
+        "NotValidForName",
       );
       tlsConn.close();
     }
 
     await Promise.all([server(), startTlsClient()]);
+  },
+);
+
+Deno.test(
+  { permissions: { net: true } },
+  async function listenTlsWithReuseAddr() {
+    const resolvable1 = deferred();
+    const hostname = "localhost";
+    const port = 3500;
+
+    const listener1 = Deno.listenTls({ hostname, port, cert, key });
+
+    listener1.accept().then((conn) => {
+      conn.close();
+      resolvable1.resolve();
+    });
+
+    const conn1 = await Deno.connectTls({ hostname, port, caCerts });
+    conn1.close();
+    await resolvable1;
+    listener1.close();
+
+    const resolvable2 = deferred();
+    const listener2 = Deno.listenTls({ hostname, port, cert, key });
+
+    listener2.accept().then((conn) => {
+      conn.close();
+      resolvable2.resolve();
+    });
+
+    const conn2 = await Deno.connectTls({ hostname, port, caCerts });
+    conn2.close();
+    await resolvable2;
+    listener2.close();
+  },
+);
+
+Deno.test({
+  ignore: Deno.build.os !== "linux",
+  permissions: { net: true },
+}, async function listenTlsReusePort() {
+  const hostname = "localhost";
+  const port = 4003;
+  const listener1 = Deno.listenTls({
+    hostname,
+    port,
+    cert,
+    key,
+    reusePort: true,
+  });
+  const listener2 = Deno.listenTls({
+    hostname,
+    port,
+    cert,
+    key,
+    reusePort: true,
+  });
+  let p1;
+  let p2;
+  let listener1Recv = false;
+  let listener2Recv = false;
+  while (!listener1Recv || !listener2Recv) {
+    if (!p1) {
+      p1 = listener1.accept().then((conn) => {
+        conn.close();
+        listener1Recv = true;
+        p1 = undefined;
+      }).catch(() => {});
+    }
+    if (!p2) {
+      p2 = listener2.accept().then((conn) => {
+        conn.close();
+        listener2Recv = true;
+        p2 = undefined;
+      }).catch(() => {});
+    }
+    const conn = await Deno.connectTls({ hostname, port, caCerts });
+    conn.close();
+    await Promise.race([p1, p2]);
+  }
+  listener1.close();
+  listener2.close();
+});
+
+Deno.test({
+  ignore: Deno.build.os === "linux",
+  permissions: { net: true },
+}, function listenTlsReusePortDoesNothing() {
+  const hostname = "localhost";
+  const port = 4003;
+  const listener1 = Deno.listenTls({
+    hostname,
+    port,
+    cert,
+    key,
+    reusePort: true,
+  });
+  assertThrows(() => {
+    Deno.listenTls({ hostname, port, cert, key, reusePort: true });
+  }, Deno.errors.AddrInUse);
+  listener1.close();
+});
+
+Deno.test({
+  permissions: { net: true },
+}, function listenTlsDoesNotThrowOnStringPort() {
+  const listener = Deno.listenTls({
+    hostname: "localhost",
+    // @ts-ignore String port is not allowed by typing, but it shouldn't throw
+    // for backwards compatibility.
+    port: "0",
+    cert,
+    key,
+  });
+  listener.close();
+});
+
+Deno.test(
+  { permissions: { net: true, read: true } },
+  function listenTLSInvalidCert() {
+    assertThrows(() => {
+      Deno.listenTls({
+        hostname: "localhost",
+        port: 3500,
+        certFile: "cli/tests/testdata/tls/invalid.crt",
+        keyFile: "cli/tests/testdata/tls/localhost.key",
+      });
+    }, Deno.errors.InvalidData);
+  },
+);
+
+Deno.test(
+  { permissions: { net: true, read: true } },
+  function listenTLSInvalidKey() {
+    assertThrows(() => {
+      Deno.listenTls({
+        hostname: "localhost",
+        port: 3500,
+        certFile: "cli/tests/testdata/tls/localhost.crt",
+        keyFile: "cli/tests/testdata/tls/invalid.key",
+      });
+    }, Deno.errors.InvalidData);
   },
 );

@@ -1,4 +1,4 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 
 pub use rustls;
 pub use rustls_native_certs;
@@ -9,15 +9,14 @@ pub use webpki_roots;
 use deno_core::anyhow::anyhow;
 use deno_core::error::custom_error;
 use deno_core::error::AnyError;
-use deno_core::parking_lot::Mutex;
-use deno_core::Extension;
 
+use rustls::client::HandshakeSignatureValid;
 use rustls::client::ServerCertVerified;
 use rustls::client::ServerCertVerifier;
-use rustls::client::StoresClientSessions;
 use rustls::client::WebPkiVerifier;
 use rustls::Certificate;
 use rustls::ClientConfig;
+use rustls::DigitallySignedStruct;
 use rustls::Error;
 use rustls::PrivateKey;
 use rustls::RootCertStore;
@@ -26,16 +25,37 @@ use rustls_pemfile::certs;
 use rustls_pemfile::pkcs8_private_keys;
 use rustls_pemfile::rsa_private_keys;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-/// This extension has no runtime apis, it only exports some shared native functions.
-pub fn init() -> Extension {
-  Extension::builder().build()
+/// Lazily resolves the root cert store.
+///
+/// This was done because the root cert store is not needed in all cases
+/// and takes a bit of time to initialize.
+pub trait RootCertStoreProvider: Send + Sync {
+  fn get_or_try_init(&self) -> Result<&RootCertStore, AnyError>;
+}
+
+// This extension has no runtime apis, it only exports some shared native functions.
+deno_core::extension!(deno_tls);
+
+struct DefaultSignatureVerification;
+
+impl ServerCertVerifier for DefaultSignatureVerification {
+  fn verify_server_cert(
+    &self,
+    _end_entity: &Certificate,
+    _intermediates: &[Certificate],
+    _server_name: &ServerName,
+    _scts: &mut dyn Iterator<Item = &[u8]>,
+    _ocsp_response: &[u8],
+    _now: SystemTime,
+  ) -> Result<ServerCertVerified, Error> {
+    Err(Error::General("Should not be used".to_string()))
+  }
 }
 
 pub struct NoCertificateVerification(pub Vec<String>);
@@ -50,27 +70,60 @@ impl ServerCertVerifier for NoCertificateVerification {
     ocsp_response: &[u8],
     now: SystemTime,
   ) -> Result<ServerCertVerified, Error> {
-    if let ServerName::DnsName(dns_name) = server_name {
-      let dns_name = dns_name.as_ref().to_owned();
-      if self.0.is_empty() || self.0.contains(&dns_name) {
-        Ok(ServerCertVerified::assertion())
-      } else {
-        let root_store = create_default_root_cert_store();
-        let verifier = WebPkiVerifier::new(root_store, None);
-        verifier.verify_server_cert(
-          end_entity,
-          intermediates,
-          server_name,
-          scts,
-          ocsp_response,
-          now,
-        )
-      }
-    } else {
-      // NOTE(bartlomieju): `ServerName` is a non-exhaustive enum
-      // so we have this catch all error here.
-      Err(Error::General("Unknown `ServerName` variant".to_string()))
+    if self.0.is_empty() {
+      return Ok(ServerCertVerified::assertion());
     }
+    let dns_name_or_ip_address = match server_name {
+      ServerName::DnsName(dns_name) => dns_name.as_ref().to_owned(),
+      ServerName::IpAddress(ip_address) => ip_address.to_string(),
+      _ => {
+        // NOTE(bartlomieju): `ServerName` is a non-exhaustive enum
+        // so we have this catch all errors here.
+        return Err(Error::General("Unknown `ServerName` variant".to_string()));
+      }
+    };
+    if self.0.contains(&dns_name_or_ip_address) {
+      Ok(ServerCertVerified::assertion())
+    } else {
+      let root_store = create_default_root_cert_store();
+      let verifier = WebPkiVerifier::new(root_store, None);
+      verifier.verify_server_cert(
+        end_entity,
+        intermediates,
+        server_name,
+        scts,
+        ocsp_response,
+        now,
+      )
+    }
+  }
+
+  fn verify_tls12_signature(
+    &self,
+    message: &[u8],
+    cert: &rustls::Certificate,
+    dss: &DigitallySignedStruct,
+  ) -> Result<HandshakeSignatureValid, Error> {
+    if self.0.is_empty() {
+      return Ok(HandshakeSignatureValid::assertion());
+    }
+    filter_invalid_encoding_err(
+      DefaultSignatureVerification.verify_tls12_signature(message, cert, dss),
+    )
+  }
+
+  fn verify_tls13_signature(
+    &self,
+    message: &[u8],
+    cert: &rustls::Certificate,
+    dss: &DigitallySignedStruct,
+  ) -> Result<HandshakeSignatureValid, Error> {
+    if self.0.is_empty() {
+      return Ok(HandshakeSignatureValid::assertion());
+    }
+    filter_invalid_encoding_err(
+      DefaultSignatureVerification.verify_tls13_signature(message, cert, dss),
+    )
   }
 }
 
@@ -89,38 +142,18 @@ pub struct BasicAuth {
   pub password: String,
 }
 
-#[derive(Default)]
-struct ClientSessionMemoryCache(Mutex<HashMap<Vec<u8>, Vec<u8>>>);
-
-impl StoresClientSessions for ClientSessionMemoryCache {
-  fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-    self.0.lock().get(key).cloned()
-  }
-
-  fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
-    let mut sessions = self.0.lock();
-    // TODO(bnoordhuis) Evict sessions LRU-style instead of arbitrarily.
-    while sessions.len() >= 1024 {
-      let key = sessions.keys().next().unwrap().clone();
-      sessions.remove(&key);
-    }
-    sessions.insert(key, value);
-    true
-  }
-}
-
 pub fn create_default_root_cert_store() -> RootCertStore {
   let mut root_cert_store = RootCertStore::empty();
   // TODO(@justinmchase): Consider also loading the system keychain here
-  root_cert_store.add_server_trust_anchors(
-    webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+  root_cert_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(
+    |ta| {
       rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
         ta.subject,
         ta.spki,
         ta.name_constraints,
       )
-    }),
-  );
+    },
+  ));
   root_cert_store
 }
 
@@ -154,7 +187,7 @@ pub fn create_client_config(
     let client =
       if let Some((cert_chain, private_key)) = maybe_cert_chain_and_key {
         client_config
-          .with_single_cert(cert_chain, private_key)
+          .with_client_auth_cert(cert_chain, private_key)
           .expect("invalid client key or certificate")
       } else {
         client_config.with_no_client_auth()
@@ -190,7 +223,7 @@ pub fn create_client_config(
   let client = if let Some((cert_chain, private_key)) = maybe_cert_chain_and_key
   {
     client_config
-      .with_single_cert(cert_chain, private_key)
+      .with_client_auth_cert(cert_chain, private_key)
       .expect("invalid client key or certificate")
   } else {
     client_config.with_no_client_auth()
@@ -231,6 +264,17 @@ fn load_rsa_keys(mut bytes: &[u8]) -> Result<Vec<PrivateKey>, AnyError> {
 fn load_pkcs8_keys(mut bytes: &[u8]) -> Result<Vec<PrivateKey>, AnyError> {
   let keys = pkcs8_private_keys(&mut bytes).map_err(|_| key_decode_err())?;
   Ok(keys.into_iter().map(PrivateKey).collect())
+}
+
+fn filter_invalid_encoding_err(
+  to_be_filtered: Result<HandshakeSignatureValid, Error>,
+) -> Result<HandshakeSignatureValid, Error> {
+  match to_be_filtered {
+    Err(Error::InvalidCertificate(rustls::CertificateError::BadEncoding)) => {
+      Ok(HandshakeSignatureValid::assertion())
+    }
+    res => res,
+  }
 }
 
 pub fn load_private_keys(bytes: &[u8]) -> Result<Vec<PrivateKey>, AnyError> {

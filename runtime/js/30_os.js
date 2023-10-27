@@ -1,103 +1,122 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
-"use strict";
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 
-((window) => {
-  const core = window.Deno.core;
-  const {
-    Error,
-    SymbolFor,
-  } = window.__bootstrap.primordials;
+const core = globalThis.Deno.core;
+const ops = core.ops;
+import { Event, EventTarget } from "ext:deno_web/02_event.js";
+const primordials = globalThis.__bootstrap.primordials;
+const {
+  Error,
+  FunctionPrototypeBind,
+  SymbolFor,
+} = primordials;
 
-  function loadavg() {
-    return core.opSync("op_loadavg");
+const windowDispatchEvent = FunctionPrototypeBind(
+  EventTarget.prototype.dispatchEvent,
+  globalThis,
+);
+
+function loadavg() {
+  return ops.op_loadavg();
+}
+
+function hostname() {
+  return ops.op_hostname();
+}
+
+function osRelease() {
+  return ops.op_os_release();
+}
+
+function osUptime() {
+  return ops.op_os_uptime();
+}
+
+function systemMemoryInfo() {
+  return ops.op_system_memory_info();
+}
+
+function networkInterfaces() {
+  return ops.op_network_interfaces();
+}
+
+function gid() {
+  return ops.op_gid();
+}
+
+function uid() {
+  return ops.op_uid();
+}
+
+// This is an internal only method used by the test harness to override the
+// behavior of exit when the exit sanitizer is enabled.
+let exitHandler = null;
+function setExitHandler(fn) {
+  exitHandler = fn;
+}
+
+function exit(code) {
+  // Set exit code first so unload event listeners can override it.
+  if (typeof code === "number") {
+    ops.op_set_exit_code(code);
+  } else {
+    code = 0;
   }
 
-  function hostname() {
-    return core.opSync("op_hostname");
+  // Dispatches `unload` only when it's not dispatched yet.
+  if (!globalThis[SymbolFor("Deno.isUnloadDispatched")]) {
+    // Invokes the `unload` hooks before exiting
+    // ref: https://github.com/denoland/deno/issues/3603
+    windowDispatchEvent(new Event("unload"));
   }
 
-  function osRelease() {
-    return core.opSync("op_os_release");
+  if (exitHandler) {
+    exitHandler(code);
+    return;
   }
 
-  function systemMemoryInfo() {
-    return core.opSync("op_system_memory_info");
-  }
+  ops.op_exit();
+  throw new Error("Code not reachable");
+}
 
-  function networkInterfaces() {
-    return core.opSync("op_network_interfaces");
-  }
+function setEnv(key, value) {
+  ops.op_set_env(key, value);
+}
 
-  function getUid() {
-    return core.opSync("op_getuid");
-  }
+function getEnv(key) {
+  return ops.op_get_env(key) ?? undefined;
+}
 
-  // This is an internal only method used by the test harness to override the
-  // behavior of exit when the exit sanitizer is enabled.
-  let exitHandler = null;
-  function setExitHandler(fn) {
-    exitHandler = fn;
-  }
+function deleteEnv(key) {
+  ops.op_delete_env(key);
+}
 
-  function exit(code) {
-    // Set exit code first so unload event listeners can override it.
-    if (typeof code === "number") {
-      core.opSync("op_set_exit_code", code);
-    } else {
-      code = 0;
-    }
+const env = {
+  get: getEnv,
+  toObject() {
+    return ops.op_env();
+  },
+  set: setEnv,
+  has(key) {
+    return getEnv(key) !== undefined;
+  },
+  delete: deleteEnv,
+};
 
-    // Dispatches `unload` only when it's not dispatched yet.
-    if (!window[SymbolFor("isUnloadDispatched")]) {
-      // Invokes the `unload` hooks before exiting
-      // ref: https://github.com/denoland/deno/issues/3603
-      window.dispatchEvent(new Event("unload"));
-    }
+function execPath() {
+  return ops.op_exec_path();
+}
 
-    if (exitHandler) {
-      exitHandler(code);
-      return;
-    }
-
-    core.opSync("op_exit");
-    throw new Error("Code not reachable");
-  }
-
-  function setEnv(key, value) {
-    core.opSync("op_set_env", key, value);
-  }
-
-  function getEnv(key) {
-    return core.opSync("op_get_env", key) ?? undefined;
-  }
-
-  function deleteEnv(key) {
-    core.opSync("op_delete_env", key);
-  }
-
-  const env = {
-    get: getEnv,
-    toObject() {
-      return core.opSync("op_env");
-    },
-    set: setEnv,
-    delete: deleteEnv,
-  };
-
-  function execPath() {
-    return core.opSync("op_exec_path");
-  }
-
-  window.__bootstrap.os = {
-    env,
-    execPath,
-    exit,
-    getUid,
-    hostname,
-    loadavg,
-    networkInterfaces,
-    osRelease,
-    setExitHandler,
-    systemMemoryInfo,
-  };
-})(this);
+export {
+  env,
+  execPath,
+  exit,
+  gid,
+  hostname,
+  loadavg,
+  networkInterfaces,
+  osRelease,
+  osUptime,
+  setExitHandler,
+  systemMemoryInfo,
+  uid,
+};

@@ -1,22 +1,23 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 
 mod in_memory_broadcast_channel;
 
 pub use in_memory_broadcast_channel::InMemoryBroadcastChannel;
 pub use in_memory_broadcast_channel::InMemoryBroadcastChannelResource;
 
-use async_trait::async_trait;
-use deno_core::error::AnyError;
-use deno_core::include_js_files;
-use deno_core::op;
-use deno_core::Extension;
-use deno_core::OpState;
-use deno_core::Resource;
-use deno_core::ResourceId;
-use deno_core::ZeroCopyBuf;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+
+use async_trait::async_trait;
+use deno_core::error::AnyError;
+use deno_core::op2;
+use deno_core::JsBuffer;
+use deno_core::OpState;
+use deno_core::Resource;
+use deno_core::ResourceId;
+
+pub const UNSTABLE_FEATURE_NAME: &str = "broadcast-channel";
 
 #[async_trait]
 pub trait BroadcastChannel: Clone {
@@ -41,33 +42,29 @@ pub trait BroadcastChannel: Clone {
 
 pub type Message = (String, Vec<u8>);
 
-struct Unstable(bool); // --unstable
-
-#[op]
+#[op2(fast)]
+#[smi]
 pub fn op_broadcast_subscribe<BC>(
   state: &mut OpState,
 ) -> Result<ResourceId, AnyError>
 where
   BC: BroadcastChannel + 'static,
 {
-  let unstable = state.borrow::<Unstable>().0;
-
-  if !unstable {
-    eprintln!(
-      "Unstable API 'BroadcastChannel'. The --unstable flag must be provided.",
-    );
-    std::process::exit(70);
-  }
-
+  // TODO(bartlomieju): replace with `state.feature_checker.check_or_exit`
+  // once we phase out `check_or_exit_with_legacy_fallback`
+  state.feature_checker.check_or_exit_with_legacy_fallback(
+    UNSTABLE_FEATURE_NAME,
+    "BroadcastChannel",
+  );
   let bc = state.borrow::<BC>();
   let resource = bc.subscribe()?;
   Ok(state.resource_table.add(resource))
 }
 
-#[op]
+#[op2(fast)]
 pub fn op_broadcast_unsubscribe<BC>(
   state: &mut OpState,
-  rid: ResourceId,
+  #[smi] rid: ResourceId,
 ) -> Result<(), AnyError>
 where
   BC: BroadcastChannel + 'static,
@@ -77,12 +74,12 @@ where
   bc.unsubscribe(&resource)
 }
 
-#[op]
+#[op2(async)]
 pub async fn op_broadcast_send<BC>(
   state: Rc<RefCell<OpState>>,
-  rid: ResourceId,
-  name: String,
-  buf: ZeroCopyBuf,
+  #[smi] rid: ResourceId,
+  #[string] name: String,
+  #[buffer] buf: JsBuffer,
 ) -> Result<(), AnyError>
 where
   BC: BroadcastChannel + 'static,
@@ -92,10 +89,11 @@ where
   bc.send(&resource, name, buf.to_vec()).await
 }
 
-#[op]
+#[op2(async)]
+#[serde]
 pub async fn op_broadcast_recv<BC>(
   state: Rc<RefCell<OpState>>,
-  rid: ResourceId,
+  #[smi] rid: ResourceId,
 ) -> Result<Option<Message>, AnyError>
 where
   BC: BroadcastChannel + 'static,
@@ -105,28 +103,23 @@ where
   bc.recv(&resource).await
 }
 
-pub fn init<BC: BroadcastChannel + 'static>(
-  bc: BC,
-  unstable: bool,
-) -> Extension {
-  Extension::builder()
-    .js(include_js_files!(
-      prefix "deno:ext/broadcast_channel",
-      "01_broadcast_channel.js",
-    ))
-    .ops(vec![
-      op_broadcast_subscribe::decl::<BC>(),
-      op_broadcast_unsubscribe::decl::<BC>(),
-      op_broadcast_send::decl::<BC>(),
-      op_broadcast_recv::decl::<BC>(),
-    ])
-    .state(move |state| {
-      state.put(bc.clone());
-      state.put(Unstable(unstable));
-      Ok(())
-    })
-    .build()
-}
+deno_core::extension!(deno_broadcast_channel,
+  deps = [ deno_webidl, deno_web ],
+  parameters = [BC: BroadcastChannel],
+  ops = [
+    op_broadcast_subscribe<BC>,
+    op_broadcast_unsubscribe<BC>,
+    op_broadcast_send<BC>,
+    op_broadcast_recv<BC>,
+  ],
+  esm = [ "01_broadcast_channel.js" ],
+  options = {
+    bc: BC,
+  },
+  state = |state, options| {
+    state.put(options.bc);
+  },
+);
 
 pub fn get_declaration() -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR"))

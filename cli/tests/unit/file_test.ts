@@ -1,4 +1,4 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 import { assert, assertEquals } from "./test_util.ts";
 
 // deno-lint-ignore no-explicit-any
@@ -98,4 +98,15 @@ Deno.test(function fileUsingNumberFileName() {
 
 Deno.test(function fileUsingEmptyStringFileName() {
   testSecondArgument("", "");
+});
+
+Deno.test(function inspectFile() {
+  assertEquals(
+    Deno.inspect(new File([], "file-name.txt")),
+    `File { name: "file-name.txt", size: 0, type: "" }`,
+  );
+  assertEquals(
+    Deno.inspect(new File([], "file-name.txt", { type: "text/plain" })),
+    `File { name: "file-name.txt", size: 0, type: "text/plain" }`,
+  );
 });

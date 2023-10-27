@@ -1,4 +1,4 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -12,11 +12,21 @@ use deno_core::anyhow::anyhow;
 use deno_core::anyhow::bail;
 use deno_core::error::AnyError;
 use deno_core::futures;
+use deno_core::futures::FutureExt;
 use deno_core::serde_json;
 use deno_graph::source::LoadFuture;
 use deno_graph::source::LoadResponse;
 use deno_graph::source::Loader;
+use deno_graph::DefaultModuleAnalyzer;
+use deno_graph::GraphKind;
 use deno_graph::ModuleGraph;
+use deno_runtime::deno_fs::RealFs;
+use import_map::ImportMap;
+
+use crate::args::JsxImportSourceConfig;
+use crate::cache::ParsedSourceCache;
+use crate::resolver::CliGraphResolver;
+use crate::resolver::CliGraphResolverOptions;
 
 use super::build::VendorEnvironment;
 
@@ -38,6 +48,22 @@ impl TestLoader {
     path_or_specifier: impl AsRef<str>,
     text: impl AsRef<str>,
   ) -> &mut Self {
+    self.add_result(path_or_specifier, Ok((text.as_ref().to_string(), None)))
+  }
+
+  pub fn add_failure(
+    &mut self,
+    path_or_specifier: impl AsRef<str>,
+    message: impl AsRef<str>,
+  ) -> &mut Self {
+    self.add_result(path_or_specifier, Err(message.as_ref().to_string()))
+  }
+
+  fn add_result(
+    &mut self,
+    path_or_specifier: impl AsRef<str>,
+    result: RemoteFileResult,
+  ) -> &mut Self {
     if path_or_specifier
       .as_ref()
       .to_lowercase()
@@ -45,14 +71,12 @@ impl TestLoader {
     {
       self.files.insert(
         ModuleSpecifier::parse(path_or_specifier.as_ref()).unwrap(),
-        Ok((text.as_ref().to_string(), None)),
+        result,
       );
     } else {
       let path = make_path(path_or_specifier.as_ref());
       let specifier = ModuleSpecifier::from_file_path(path).unwrap();
-      self
-        .files
-        .insert(specifier, Ok((text.as_ref().to_string(), None)));
+      self.files.insert(specifier, result);
     }
     self
   }
@@ -92,12 +116,13 @@ impl Loader for TestLoader {
     &mut self,
     specifier: &ModuleSpecifier,
     _is_dynamic: bool,
+    _cache_setting: deno_graph::source::CacheSetting,
   ) -> LoadFuture {
     let specifier = self.redirects.get(specifier).unwrap_or(specifier);
     let result = self.files.get(specifier).map(|result| match result {
       Ok(result) => Ok(LoadResponse::Module {
         specifier: specifier.clone(),
-        content: Arc::new(result.0.clone()),
+        content: result.0.clone().into(),
         maybe_headers: result.1.clone(),
       }),
       Err(err) => Err(err),
@@ -121,6 +146,10 @@ struct TestVendorEnvironment {
 }
 
 impl VendorEnvironment for TestVendorEnvironment {
+  fn cwd(&self) -> Result<PathBuf, AnyError> {
+    Ok(make_path("/"))
+  }
+
   fn create_dir_all(&self, dir_path: &Path) -> Result<(), AnyError> {
     let mut directories = self.directories.borrow_mut();
     for path in dir_path.ancestors() {
@@ -142,6 +171,10 @@ impl VendorEnvironment for TestVendorEnvironment {
       .insert(file_path.to_path_buf(), text.to_string());
     Ok(())
   }
+
+  fn path_exists(&self, path: &Path) -> bool {
+    self.files.borrow().contains_key(&path.to_path_buf())
+  }
 }
 
 pub struct VendorOutput {
@@ -153,6 +186,9 @@ pub struct VendorOutput {
 pub struct VendorTestBuilder {
   entry_points: Vec<ModuleSpecifier>,
   loader: TestLoader,
+  original_import_map: Option<ImportMap>,
+  environment: TestVendorEnvironment,
+  jsx_import_source_config: Option<JsxImportSourceConfig>,
 }
 
 impl VendorTestBuilder {
@@ -160,6 +196,23 @@ impl VendorTestBuilder {
     let mut builder = VendorTestBuilder::default();
     builder.add_entry_point("/mod.ts");
     builder
+  }
+
+  pub fn resolve_to_url(&self, path: &str) -> ModuleSpecifier {
+    ModuleSpecifier::from_file_path(make_path(path)).unwrap()
+  }
+
+  pub fn new_import_map(&self, base_path: &str) -> ImportMap {
+    let base = self.resolve_to_url(base_path);
+    ImportMap::new(base)
+  }
+
+  pub fn set_original_import_map(
+    &mut self,
+    import_map: ImportMap,
+  ) -> &mut Self {
+    self.original_import_map = Some(import_map);
+    self
   }
 
   pub fn add_entry_point(&mut self, entry_point: impl AsRef<str>) -> &mut Self {
@@ -170,16 +223,58 @@ impl VendorTestBuilder {
     self
   }
 
+  pub fn set_jsx_import_source_config(
+    &mut self,
+    jsx_import_source_config: JsxImportSourceConfig,
+  ) -> &mut Self {
+    self.jsx_import_source_config = Some(jsx_import_source_config);
+    self
+  }
+
   pub async fn build(&mut self) -> Result<VendorOutput, AnyError> {
-    let graph = self.build_graph().await;
     let output_dir = make_path("/vendor");
-    let environment = TestVendorEnvironment::default();
-    super::build::build(&graph, &output_dir, &environment)?;
-    let mut files = environment.files.borrow_mut();
+    let entry_points = self.entry_points.clone();
+    let loader = self.loader.clone();
+    let parsed_source_cache = ParsedSourceCache::default();
+    let resolver = Arc::new(build_resolver(
+      self.jsx_import_source_config.clone(),
+      self.original_import_map.clone(),
+    ));
+    super::build::build(super::build::BuildInput {
+      entry_points,
+      build_graph: {
+        let resolver = resolver.clone();
+        move |entry_points| {
+          async move {
+            let analyzer = DefaultModuleAnalyzer::default();
+            Ok(
+              build_test_graph(
+                entry_points,
+                loader,
+                resolver.as_graph_resolver(),
+                &analyzer,
+              )
+              .await,
+            )
+          }
+          .boxed_local()
+        }
+      },
+      parsed_source_cache: &parsed_source_cache,
+      output_dir: &output_dir,
+      maybe_original_import_map: self.original_import_map.as_ref(),
+      maybe_lockfile: None,
+      maybe_jsx_import_source: self.jsx_import_source_config.as_ref(),
+      resolver: resolver.as_graph_resolver(),
+      environment: &self.environment,
+    })
+    .await?;
+
+    let mut files = self.environment.files.borrow_mut();
     let import_map = files.remove(&output_dir.join("import_map.json"));
     let mut files = files
       .iter()
-      .map(|(path, text)| (path_to_string(path), text.clone()))
+      .map(|(path, text)| (path_to_string(path), text.to_string()))
       .collect::<Vec<_>>();
 
     files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -194,27 +289,44 @@ impl VendorTestBuilder {
     action(&mut self.loader);
     self
   }
+}
 
-  async fn build_graph(&mut self) -> ModuleGraph {
-    let graph = deno_graph::create_graph(
-      self
-        .entry_points
-        .iter()
-        .map(|s| (s.to_owned(), deno_graph::ModuleKind::Esm))
-        .collect(),
-      false,
-      None,
-      &mut self.loader,
-      None,
-      None,
-      None,
-      None,
+fn build_resolver(
+  maybe_jsx_import_source_config: Option<JsxImportSourceConfig>,
+  original_import_map: Option<ImportMap>,
+) -> CliGraphResolver {
+  CliGraphResolver::new(CliGraphResolverOptions {
+    fs: Arc::new(RealFs),
+    node_resolver: None,
+    npm_resolver: None,
+    cjs_resolutions: None,
+    package_json_deps_provider: Default::default(),
+    maybe_jsx_import_source_config,
+    maybe_import_map: original_import_map.map(Arc::new),
+    maybe_vendor_dir: None,
+    bare_node_builtins_enabled: false,
+  })
+}
+
+async fn build_test_graph(
+  roots: Vec<ModuleSpecifier>,
+  mut loader: TestLoader,
+  resolver: &dyn deno_graph::source::Resolver,
+  analyzer: &dyn deno_graph::ModuleAnalyzer,
+) -> ModuleGraph {
+  let mut graph = ModuleGraph::new(GraphKind::All);
+  graph
+    .build(
+      roots,
+      &mut loader,
+      deno_graph::BuildOptions {
+        resolver: Some(resolver),
+        module_analyzer: Some(analyzer),
+        ..Default::default()
+      },
     )
     .await;
-    graph.lock().unwrap();
-    graph.valid().unwrap();
-    graph
-  }
+  graph
 }
 
 fn make_path(text: &str) -> PathBuf {
@@ -229,7 +341,11 @@ fn make_path(text: &str) -> PathBuf {
   }
 }
 
-fn path_to_string(path: &Path) -> String {
+fn path_to_string<P>(path: P) -> String
+where
+  P: AsRef<Path>,
+{
+  let path = path.as_ref();
   // inverse of the function above
   let path = path.to_string_lossy();
   if cfg!(windows) {

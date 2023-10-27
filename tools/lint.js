@@ -1,33 +1,62 @@
-#!/usr/bin/env -S deno run --unstable --allow-write --allow-read --allow-run
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
-import {
-  buildMode,
-  getPrebuiltToolPath,
-  getSources,
-  join,
-  ROOT_PATH,
-} from "./util.js";
+#!/usr/bin/env -S deno run --unstable --allow-write --allow-read --allow-run --allow-net
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+import { buildMode, getPrebuilt, getSources, join, ROOT_PATH } from "./util.js";
+import { checkCopyright } from "./copyright_checker.js";
+
+const promises = [];
+
+let js = Deno.args.includes("--js");
+let rs = Deno.args.includes("--rs");
+if (!js && !rs) {
+  js = true;
+  rs = true;
+}
+
+if (js) {
+  promises.push(dlint());
+  promises.push(dlintPreferPrimordials());
+}
+
+if (rs) {
+  promises.push(clippy());
+}
+
+if (js && rs) {
+  promises.push(checkCopyright());
+}
+
+const results = await Promise.allSettled(promises);
+for (const result of results) {
+  if (result.status === "rejected") {
+    console.error(result.reason);
+    Deno.exit(1);
+  }
+}
 
 async function dlint() {
   const configFile = join(ROOT_PATH, ".dlint.json");
-  const execPath = getPrebuiltToolPath("dlint");
-  console.log("dlint");
+  const execPath = await getPrebuilt("dlint");
 
   const sourceFiles = await getSources(ROOT_PATH, [
     "*.js",
     "*.ts",
     ":!:.github/mtime_cache/action.js",
     ":!:cli/tests/testdata/swc_syntax_error.ts",
-    ":!:cli/tests/testdata/038_checkjs.js",
     ":!:cli/tests/testdata/error_008_checkjs.js",
-    ":!:cli/bench/node*.js",
+    ":!:cli/bench/testdata/npm/*",
     ":!:cli/bench/testdata/express-router.js",
+    ":!:cli/bench/testdata/react-dom.js",
     ":!:cli/compilers/wasm_wrap.js",
-    ":!:cli/dts/**",
+    ":!:cli/tsc/dts/**",
     ":!:cli/tests/testdata/encoding/**",
     ":!:cli/tests/testdata/error_syntax.js",
+    ":!:cli/tests/testdata/file_extensions/ts_with_js_extension.js",
+    ":!:cli/tests/testdata/fmt/**",
+    ":!:cli/tests/testdata/npm/**",
     ":!:cli/tests/testdata/lint/**",
+    ":!:cli/tests/testdata/run/**",
     ":!:cli/tests/testdata/tsc/**",
+    ":!:cli/tests/testdata/test/glob/**",
     ":!:cli/tsc/*typescript.js",
     ":!:cli/tsc/compiler.d.ts",
     ":!:test_util/wpt/**",
@@ -38,29 +67,41 @@ async function dlint() {
   }
 
   const chunks = splitToChunks(sourceFiles, `${execPath} run`.length);
+  const pending = [];
   for (const chunk of chunks) {
-    const p = Deno.run({
-      cmd: [execPath, "run", "--config=" + configFile, ...chunk],
+    const cmd = new Deno.Command(execPath, {
+      cwd: ROOT_PATH,
+      args: ["run", "--config=" + configFile, ...chunk],
+      // capture to not conflict with clippy output
+      stderr: "piped",
     });
-    const { success } = await p.status();
-    if (!success) {
-      throw new Error("dlint failed");
-    }
-    p.close();
+    pending.push(
+      cmd.output().then(({ stderr, code }) => {
+        if (code > 0) {
+          const decoder = new TextDecoder();
+          console.log("\n------ dlint ------");
+          console.log(decoder.decode(stderr));
+          throw new Error("dlint failed");
+        }
+      }),
+    );
   }
+  await Promise.all(pending);
 }
 
 // `prefer-primordials` has to apply only to files related to bootstrapping,
 // which is different from other lint rules. This is why this dedicated function
 // is needed.
 async function dlintPreferPrimordials() {
-  const execPath = getPrebuiltToolPath("dlint");
-  console.log("prefer-primordials");
-
+  const execPath = await getPrebuilt("dlint");
   const sourceFiles = await getSources(ROOT_PATH, [
     "runtime/**/*.js",
     "ext/**/*.js",
-    "core/**/*.js",
+    "ext/node/polyfills/*.mjs",
+    "ext/node/polyfills/*.ts",
+    ":!:ext/node/polyfills/*.d.ts",
+    "core/*.js",
+    ":!:core/*_test.js",
     ":!:core/examples/**",
   ]);
 
@@ -70,14 +111,17 @@ async function dlintPreferPrimordials() {
 
   const chunks = splitToChunks(sourceFiles, `${execPath} run`.length);
   for (const chunk of chunks) {
-    const p = Deno.run({
-      cmd: [execPath, "run", "--rule", "prefer-primordials", ...chunk],
+    const cmd = new Deno.Command(execPath, {
+      cwd: ROOT_PATH,
+      args: ["run", "--rule", "prefer-primordials", ...chunk],
+      stdout: "inherit",
+      stderr: "inherit",
     });
-    const { success } = await p.status();
-    if (!success) {
+    const { code } = await cmd.output();
+
+    if (code > 0) {
       throw new Error("prefer-primordials failed");
     }
-    p.close();
   }
 }
 
@@ -98,53 +142,27 @@ function splitToChunks(paths, initCmdLen) {
 }
 
 async function clippy() {
-  console.log("clippy");
-
   const currentBuildMode = buildMode();
-  const cmd = ["cargo", "clippy", "--all-targets", "--locked"];
+  const cmd = ["clippy", "--all-targets", "--all-features", "--locked"];
 
   if (currentBuildMode != "debug") {
     cmd.push("--release");
   }
 
-  const p = Deno.run({
-    cmd: [
+  const cargoCmd = new Deno.Command("cargo", {
+    cwd: ROOT_PATH,
+    args: [
       ...cmd,
       "--",
       "-D",
-      "clippy::all",
-      "-D",
-      "clippy::await_holding_refcell_ref",
+      "warnings",
     ],
+    stdout: "inherit",
+    stderr: "inherit",
   });
-  const { success } = await p.status();
-  if (!success) {
+  const { code } = await cargoCmd.output();
+
+  if (code > 0) {
     throw new Error("clippy failed");
   }
-  p.close();
 }
-
-async function main() {
-  await Deno.chdir(ROOT_PATH);
-
-  let didLint = false;
-
-  if (Deno.args.includes("--js")) {
-    await dlint();
-    await dlintPreferPrimordials();
-    didLint = true;
-  }
-
-  if (Deno.args.includes("--rs")) {
-    await clippy();
-    didLint = true;
-  }
-
-  if (!didLint) {
-    await dlint();
-    await dlintPreferPrimordials();
-    await clippy();
-  }
-}
-
-await main();

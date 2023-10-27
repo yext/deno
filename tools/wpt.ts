@@ -1,5 +1,5 @@
 #!/usr/bin/env -S deno run --unstable --allow-write --allow-read --allow-net --allow-env --allow-run
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 
 // This script is used to run WPT tests for Deno.
 
@@ -25,15 +25,42 @@ import {
   ManifestFolder,
   ManifestTestOptions,
   ManifestTestVariation,
+  noIgnore,
   quiet,
   rest,
   runPy,
   updateManifest,
   wptreport,
 } from "./wpt/utils.ts";
+import { pooledMap } from "../test_util/std/async/pool.ts";
 import { blue, bold, green, red, yellow } from "../test_util/std/fmt/colors.ts";
-import { writeAll, writeAllSync } from "../test_util/std/streams/conversion.ts";
+import { writeAll, writeAllSync } from "../test_util/std/streams/write_all.ts";
 import { saveExpectation } from "./wpt/utils.ts";
+
+class TestFilter {
+  filter?: string[];
+  constructor(filter?: string[]) {
+    this.filter = filter;
+  }
+
+  matches(path: string): boolean {
+    if (this.filter === undefined || this.filter.length == 0) {
+      return true;
+    }
+    for (const filter of this.filter) {
+      if (filter.startsWith("/")) {
+        if (path.startsWith(filter)) {
+          return true;
+        }
+      } else {
+        if (path.substring(1).startsWith(filter)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+}
 
 const command = Deno.args[0];
 
@@ -90,10 +117,11 @@ async function setup() {
         `The WPT require certain entries to be present in your ${hostsPath} file. Should these be configured automatically?`,
       );
     if (autoConfigure) {
-      const proc = runPy(["wpt", "make-hosts-file"], { stdout: "piped" });
-      const status = await proc.status();
-      assert(status.success, "wpt make-hosts-file should not fail");
-      const entries = new TextDecoder().decode(await proc.output());
+      const { success, stdout } = await runPy(["wpt", "make-hosts-file"], {
+        stdout: "piped",
+      }).output();
+      assert(success, "wpt make-hosts-file should not fail");
+      const entries = new TextDecoder().decode(stdout);
       const file = await Deno.open(hostsPath, { append: true }).catch((err) => {
         if (err instanceof Deno.errors.PermissionDenied) {
           throw new Error(
@@ -142,30 +170,60 @@ interface TestToRun {
   expectation: boolean | string[];
 }
 
+function getTestTimeout(test: TestToRun) {
+  if (Deno.env.get("CI")) {
+    // Don't give expected failures the full time
+    if (test.expectation === false) {
+      return { long: 60_000, default: 10_000 };
+    }
+    return { long: 4 * 60_000, default: 4 * 60_000 };
+  }
+
+  return { long: 60_000, default: 10_000 };
+}
+
 async function run() {
   const startTime = new Date().getTime();
   assert(Array.isArray(rest), "filter must be array");
   const expectation = getExpectation();
+  const filter = new TestFilter(rest);
   const tests = discoverTestsToRun(
-    rest.length == 0 ? undefined : rest,
+    filter,
     expectation,
   );
-  assertAllExpectationsHaveTests(expectation, tests, rest);
-  console.log(`Going to run ${tests.length} test files.`);
+  assertAllExpectationsHaveTests(expectation, tests, filter);
+  const cores = navigator.hardwareConcurrency;
+  console.log(`Going to run ${tests.length} test files on ${cores} cores.`);
 
   const results = await runWithTestUtil(false, async () => {
-    const results = [];
+    const results: { test: TestToRun; result: TestResult }[] = [];
+    const inParallel = !(cores === 1 || tests.length === 1);
+    // ideally we would parallelize all tests, but we ran into some flakiness
+    // on the CI, so here we're partitioning based on the start of the test path
+    const partitionedTests = partitionTests(tests);
 
-    for (const test of tests) {
-      console.log(`${blue("-".repeat(40))}\n${bold(test.path)}\n`);
-      const result = await runSingleTest(
-        test.url,
-        test.options,
-        createReportTestCase(test.expectation),
-        inspectBrk,
-      );
-      results.push({ test, result });
-      reportVariation(result, test.expectation);
+    const iter = pooledMap(cores, partitionedTests, async (tests) => {
+      for (const test of tests) {
+        if (!inParallel) {
+          console.log(`${blue("-".repeat(40))}\n${bold(test.path)}\n`);
+        }
+        const result = await runSingleTest(
+          test.url,
+          test.options,
+          inParallel ? () => {} : createReportTestCase(test.expectation),
+          inspectBrk,
+          getTestTimeout(test),
+        );
+        results.push({ test, result });
+        if (inParallel) {
+          console.log(`${blue("-".repeat(40))}\n${bold(test.path)}\n`);
+        }
+        reportVariation(result, test.expectation);
+      }
+    });
+
+    for await (const _ of iter) {
+      // ignore
     }
 
     return results;
@@ -195,7 +253,7 @@ async function run() {
     await Deno.writeTextFile(wptreport, JSON.stringify(report));
   }
 
-  const code = reportFinal(results);
+  const code = reportFinal(results, endTime - startTime);
   Deno.exit(code);
 }
 
@@ -227,8 +285,10 @@ async function generateWptReport(
         if (!case_.passed) {
           if (typeof test.expectation === "boolean") {
             expected = test.expectation ? "PASS" : "FAIL";
-          } else {
+          } else if (Array.isArray(test.expectation)) {
             expected = test.expectation.includes(case_.name) ? "FAIL" : "PASS";
+          } else {
+            expected = "PASS";
           }
         }
 
@@ -261,22 +321,18 @@ async function generateWptReport(
 function assertAllExpectationsHaveTests(
   expectation: Expectation,
   testsToRun: TestToRun[],
-  filter?: string[],
+  filter: TestFilter,
 ): void {
   const tests = new Set(testsToRun.map((t) => t.path));
   const missingTests: string[] = [];
-
   function walk(parentExpectation: Expectation, parent: string) {
-    for (const key in parentExpectation) {
+    for (const [key, expectation] of Object.entries(parentExpectation)) {
       const path = `${parent}/${key}`;
+      if (!filter.matches(path)) continue;
       if (
-        filter &&
-        !filter.find((filter) => path.substring(1).startsWith(filter))
+        (typeof expectation == "boolean" || Array.isArray(expectation)) &&
+        key !== "ignore"
       ) {
-        continue;
-      }
-      const expectation = parentExpectation[key];
-      if (typeof expectation == "boolean" || Array.isArray(expectation)) {
         if (!tests.has(path)) {
           missingTests.push(path);
         }
@@ -302,7 +358,9 @@ function assertAllExpectationsHaveTests(
 
 async function update() {
   assert(Array.isArray(rest), "filter must be array");
-  const tests = discoverTestsToRun(rest.length == 0 ? undefined : rest, true);
+  const startTime = new Date().getTime();
+  const filter = new TestFilter(rest);
+  const tests = discoverTestsToRun(filter, true);
   console.log(`Going to run ${tests.length} test files.`);
 
   const results = await runWithTestUtil(false, async () => {
@@ -315,6 +373,7 @@ async function update() {
         test.options,
         json ? () => {} : createReportTestCase(test.expectation),
         inspectBrk,
+        { long: 60_000, default: 10_000 },
       );
       results.push({ test, result });
       reportVariation(result, test.expectation);
@@ -322,6 +381,7 @@ async function update() {
 
     return results;
   });
+  const endTime = new Date().getTime();
 
   if (json) {
     await Deno.writeTextFile(json, JSON.stringify(results));
@@ -350,8 +410,8 @@ async function update() {
 
   const currentExpectation = getExpectation();
 
-  for (const path in resultTests) {
-    const { passed, failed, testSucceeded } = resultTests[path];
+  for (const [path, result] of Object.entries(resultTests)) {
+    const { passed, failed, testSucceeded } = result;
     let finalExpectation: boolean | string[];
     if (failed.length == 0 && testSucceeded) {
       finalExpectation = true;
@@ -370,7 +430,7 @@ async function update() {
 
   saveExpectation(currentExpectation);
 
-  reportFinal(results);
+  reportFinal(results, endTime - startTime);
 
   console.log(blue("Updated expectation.json to match reality."));
 
@@ -404,6 +464,7 @@ function insertExpectation(
 
 function reportFinal(
   results: { test: TestToRun; result: TestResult }[],
+  duration: number,
 ): number {
   const finalTotalCount = results.length;
   let finalFailedCount = 0;
@@ -485,7 +546,7 @@ function reportFinal(
   console.log(
     `\nfinal result: ${
       failed ? red("failed") : green("ok")
-    }. ${finalPassedCount} passed; ${finalFailedCount} failed; ${finalExpectedFailedAndFailedCount} expected failure; total ${finalTotalCount}\n`,
+    }. ${finalPassedCount} passed; ${finalFailedCount} failed; ${finalExpectedFailedAndFailedCount} expected failure; total ${finalTotalCount} (${duration}ms)\n`,
   );
 
   return failed ? 1 : 0;
@@ -530,8 +591,9 @@ function analyzeTestResult(
 
 function reportVariation(result: TestResult, expectation: boolean | string[]) {
   if (result.status !== 0 || result.harnessStatus === null) {
-    console.log(`test stderr:`);
-    writeAllSync(Deno.stdout, new TextEncoder().encode(result.stderr));
+    if (result.stderr) {
+      console.log(`test stderr:\n${result.stderr}\n`);
+    }
 
     const expectFail = expectation === false;
     const failReason = result.status !== 0
@@ -540,7 +602,7 @@ function reportVariation(result: TestResult, expectation: boolean | string[]) {
     console.log(
       `\nfile result: ${
         expectFail ? yellow("failed (expected)") : red("failed")
-      }. ${failReason}\n`,
+      }. ${failReason} (${formatDuration(result.duration)})\n`,
     );
     return;
   }
@@ -574,10 +636,15 @@ function reportVariation(result: TestResult, expectation: boolean | string[]) {
   for (const result of expectedFailedButPassed) {
     console.log(`        ${JSON.stringify(result.name)}`);
   }
+  if (result.stderr) {
+    console.log("\ntest stderr:\n" + result.stderr);
+  }
   console.log(
     `\nfile result: ${
       failedCount > 0 ? red("failed") : green("ok")
-    }. ${passedCount} passed; ${failedCount} failed; ${expectedFailedAndFailedCount} expected failure; total ${totalCount}\n`,
+    }. ${passedCount} passed; ${failedCount} failed; ${expectedFailedAndFailedCount} expected failure; total ${totalCount} (${
+      formatDuration(result.duration)
+    })\n`,
   );
 }
 
@@ -625,7 +692,7 @@ function createReportTestCase(expectation: boolean | string[]) {
 }
 
 function discoverTestsToRun(
-  filter?: string[],
+  filter: TestFilter,
   expectation: Expectation | string[] | boolean = getExpectation(),
 ): TestToRun[] {
   const manifestFolder = getManifest().items.testharness;
@@ -637,9 +704,7 @@ function discoverTestsToRun(
     parentExpectation: Expectation | string[] | boolean,
     prefix: string,
   ) {
-    for (const key in parentFolder) {
-      const entry = parentFolder[key];
-
+    for (const [key, entry] of Object.entries(parentFolder)) {
       if (Array.isArray(entry)) {
         for (
           const [path, options] of entry.slice(
@@ -678,17 +743,25 @@ function discoverTestsToRun(
 
           if (expectation === undefined) continue;
 
-          assert(
-            Array.isArray(expectation) || typeof expectation == "boolean",
-            "test entry must not have a folder expectation",
-          );
-
-          if (
-            filter &&
-            !filter.find((filter) => finalPath.substring(1).startsWith(filter))
-          ) {
-            continue;
+          if (typeof expectation === "object") {
+            if (typeof expectation.ignore !== "undefined") {
+              assert(
+                typeof expectation.ignore === "boolean",
+                "test entry's `ignore` key must be a boolean",
+              );
+              if (expectation.ignore === true && !noIgnore) continue;
+            }
           }
+
+          if (!noIgnore) {
+            assert(
+              Array.isArray(expectation) || typeof expectation == "boolean",
+              "test entry must not have a folder expectation",
+            );
+          }
+
+          if (!filter.matches(finalPath)) continue;
+
           testsToRun.push({
             path: finalPath,
             url,
@@ -711,4 +784,32 @@ function discoverTestsToRun(
   walk(manifestFolder, expectation, "");
 
   return testsToRun;
+}
+
+function partitionTests(tests: TestToRun[]): TestToRun[][] {
+  const testsByKey: { [key: string]: TestToRun[] } = {};
+  for (const test of tests) {
+    // Run all WebCryptoAPI tests in parallel
+    if (test.path.includes("/WebCryptoAPI")) {
+      testsByKey[test.path] = [test];
+      continue;
+    }
+    // Paths looks like: /fetch/corb/img-html-correctly-labeled.sub-ref.html
+    const key = test.path.split("/")[1];
+    if (!(key in testsByKey)) {
+      testsByKey[key] = [];
+    }
+    testsByKey[key].push(test);
+  }
+  return Object.values(testsByKey);
+}
+
+function formatDuration(duration: number): string {
+  if (duration >= 5000) {
+    return red(`${duration}ms`);
+  } else if (duration >= 1000) {
+    return yellow(`${duration}ms`);
+  } else {
+    return `${duration}ms`;
+  }
 }
